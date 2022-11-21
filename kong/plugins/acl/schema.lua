@@ -18,6 +18,5 @@ return {
   },
   entity_checks = {
     { only_one_of = { "config.allow", "config.deny" }, },
-    { at_least_one_of = { "config.allow", "config.deny" }, },
   },
 }
