@@ -16,6 +16,11 @@ host_ports = NONE
 anonymous_reports = on
 proxy_server = NONE
 proxy_server_ssl_verify = on
+error_template_html = NONE
+error_template_json = NONE
+error_template_xml = NONE
+error_template_plain = NONE
+node_id = NONE
 
 proxy_listen = 0.0.0.0:8000 reuseport backlog=16384, 0.0.0.0:8443 http2 ssl reuseport backlog=16384
 stream_listen = off
@@ -32,6 +37,7 @@ cluster_data_plane_purge_delay = 1209600
 cluster_ocsp = off
 cluster_max_payload = 4194304
 cluster_use_proxy = off
+cluster_dp_labels = NONE
 
 lmdb_environment_path = dbless.lmdb
 lmdb_map_size = 128m
@@ -48,6 +54,7 @@ ssl_prefer_server_ciphers = on
 ssl_dhparam = NONE
 ssl_session_tickets = on
 ssl_session_timeout = 1d
+ssl_session_cache_size = 10m
 admin_ssl_cert = NONE
 admin_ssl_cert_key = NONE
 status_ssl_cert = NONE
@@ -58,6 +65,7 @@ error_default_type = text/plain
 upstream_keepalive_pool_size = 60
 upstream_keepalive_max_requests = 100
 upstream_keepalive_idle_timeout = 60
+allow_debug_header = off
 
 nginx_user = kong kong
 nginx_worker_processes = auto
@@ -68,6 +76,7 @@ nginx_main_worker_processes = auto
 nginx_main_worker_rlimit_nofile = auto
 nginx_events_worker_connections = auto
 nginx_events_multi_accept = on
+nginx_http_charset = UTF-8
 nginx_http_client_max_body_size = 0
 nginx_http_client_body_buffer_size = 8k
 nginx_http_ssl_protocols = NONE
@@ -107,6 +116,7 @@ pg_semaphore_timeout = 60000
 pg_keepalive_timeout = NONE
 pg_pool_size = NONE
 pg_backlog = NONE
+_debug_pg_ttl_cleanup_interval = 300
 
 pg_ro_host = NONE
 pg_ro_port = NONE
@@ -173,6 +183,11 @@ lua_ssl_protocols = TLSv1.1 TLSv1.2 TLSv1.3
 lua_package_path = ./?.lua;./?/init.lua;
 lua_package_cpath = NONE
 
+lua_max_req_headers = 100
+lua_max_resp_headers = 100
+lua_max_uri_args = 100
+lua_max_post_args = 100
+
 role = traditional
 kic = off
 pluginserver_names = NONE
@@ -181,12 +196,10 @@ untrusted_lua = sandbox
 untrusted_lua_sandbox_requires =
 untrusted_lua_sandbox_environment =
 
-legacy_worker_events = off
-
 openresty_path =
 
 opentelemetry_tracing = off
-opentelemetry_tracing_sampling_rate = 1.0
-
-max_queued_batches = 100
+opentelemetry_tracing_sampling_rate = 0.01
+tracing_instrumentations = off
+tracing_sampling_rate = 0.01
 ]]

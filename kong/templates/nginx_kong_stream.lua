@@ -18,7 +18,6 @@ lua_ssl_trusted_certificate '${{LUA_SSL_TRUSTED_CERTIFICATE_COMBINED}}';
 lua_shared_dict stream_kong                        5m;
 lua_shared_dict stream_kong_locks                  8m;
 lua_shared_dict stream_kong_healthchecks           5m;
-lua_shared_dict stream_kong_process_events         5m;
 lua_shared_dict stream_kong_cluster_events         5m;
 lua_shared_dict stream_kong_rate_limiting_counters 12m;
 lua_shared_dict stream_kong_core_db_cache          ${{MEM_CACHE_SIZE}};
@@ -110,17 +109,17 @@ server {
     ssl_certificate     $(ssl_cert[i]);
     ssl_certificate_key $(ssl_cert_key[i]);
 > end
-    ssl_session_cache   shared:StreamSSL:10m;
+    ssl_session_cache   shared:StreamSSL:${{SSL_SESSION_CACHE_SIZE}};
     ssl_certificate_by_lua_block {
         Kong.ssl_certificate()
     }
 > end
 
-    set $tls_sni_name 'kong_upstream';
+    set $upstream_host '';
     preread_by_lua_block {
         Kong.preread()
     }
-    proxy_ssl_name $tls_sni_name;
+    proxy_ssl_name $upstream_host;
 
     proxy_ssl on;
     proxy_ssl_server_name on;
@@ -219,7 +218,6 @@ server {        # ignore (and close }, to ignore content)
 }
 > end -- #stream_listeners > 0
 
-> if not legacy_worker_events then
 server {
     listen unix:${{PREFIX}}/stream_worker_events.sock;
     error_log  ${{ADMIN_ERROR_LOG}} ${{LOG_LEVEL}};
@@ -228,5 +226,4 @@ server {
       require("resty.events.compat").run()
     }
 }
-> end -- not legacy_worker_events
 ]]

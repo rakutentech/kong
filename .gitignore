@@ -4,6 +4,8 @@
 .project
 .idea
 .env
+.vscode
+.VSCodeCounter
 
 servroot*
 
@@ -29,3 +31,6 @@ bin/grpcurl
 *.rock
 
 bazel-*
+
+worktree/
+bin/bazel

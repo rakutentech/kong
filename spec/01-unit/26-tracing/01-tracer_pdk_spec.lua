@@ -1,13 +1,65 @@
 require "spec.helpers" -- initializes 'kong' global for tracer
+local match = require("luassert.match")
+
+local utils = require "kong.tools.utils"
+local SAMPLING_BYTE = 8
+local rand_bytes = utils.get_rand_bytes
+local TEST_COUNT = 10000
+-- we can only ensure a sampling precision of 0.02
+local SAMPLING_PRECISION = 0.02
+
+local function assert_sample_rate(actual, expected)
+  local diff = math.abs(actual - expected)
+  assert(diff < SAMPLING_PRECISION, "sampling rate is not correct: " .. actual .. " expected: " .. expected)
+end
+
+--- hook ngx.log to a spy for unit test
+--- usage: local log_spy = hook_log_spy() -- hook ngx.log to a spy
+---        -- do stuff
+---        assert.spy(log_spy).was_called_with(ngx.ERR, "some error")
+---        -- unhook
+---        unhook_log_spy()
+--- note that all messages arguments are concatenated together.
+--- this hook slows down the test execution by a lot so only use if necessary.
+-- @function hook_log_spy
+-- @return log_spy the spy
+local function hook_log_spy()
+  local log_spy = spy(function() end)
+  local level, msg
+  -- the only reliable way to hook into ngx.log
+  -- is to use debug.sethook as ngx.log is always
+  -- localized and even reload the module does not work
+  debug.sethook(function()
+    if debug.getinfo(2, 'f').func == ngx.log then
+      level, msg = select(2, debug.getlocal(2, 1)),
+      table.concat {
+        select(2, debug.getlocal(2, 2)),
+        select(2, debug.getlocal(2, 3)),
+        select(2, debug.getlocal(2, 4)),
+        select(2, debug.getlocal(2, 5)),
+        select(2, debug.getlocal(2, 6)),
+      }
+      print(msg)
+      log_spy(level, msg)
+    end
+  end, "c", 1)
+  return log_spy
+end
+
+local unhook_log_spy = debug.sethook
 
 describe("Tracer PDK", function()
   local ok, err, _
+  local log_spy
 
   lazy_setup(function()
     local kong_global = require "kong.global"
     _G.kong = kong_global.new()
     kong_global.init_pdk(kong)
+    log_spy = hook_log_spy()
   end)
+
+  lazy_teardown(unhook_log_spy)
 
   describe("initialize tracer", function()
 
@@ -124,6 +176,7 @@ describe("Tracer PDK", function()
         attributes = {
           "key1", "value1"
         },
+        linked = true,
       }
 
       span = c_tracer.start_span("meow", tpl)
@@ -138,16 +191,21 @@ describe("Tracer PDK", function()
 
     it("fails set_attribute", function ()
       local span = c_tracer.start_span("meow")
-      assert.error(function() span:set_attribute("key1") end)
-      assert.error(function() span:set_attribute("key1", function() end) end)
+
+      span:set_attribute("key1")
+      assert.spy(log_spy).was_called_with(ngx.ERR, match.is_string())
+
+      span:set_attribute("key1", function() end)
+      assert.spy(log_spy).was_called_with(ngx.ERR, match.is_string())
+
       assert.error(function() span:set_attribute(123, 123) end)
     end)
 
     it("fails add_event", function ()
       local span = c_tracer.start_span("meow")
-      assert.error(function() span:set_attribute("key1") end)
-      assert.error(function() span:set_attribute("key1", function() end) end)
-      assert.error(function() span:set_attribute(123, 123) end)
+      assert.error(function() span:add_event("key1", 123) end)
+      assert.error(function() span:add_event("key1", function() end) end)
+      assert.error(function() span:add_event(123, {}) end)
     end)
 
     it("child spans", function ()
@@ -229,6 +287,60 @@ describe("Tracer PDK", function()
       span:release()
       assert.same({}, span)
     end)
+
+    for _, len in ipairs{8, 16, 9, 32, 5} do
+      it("#10402 sample rate works for traceID of length " .. len, function ()
+        -- a random sample rate
+        local rand_offset = math.random(-10000, 10000) * 0.0000001
+        local sampling_rate = 0.5 + rand_offset
+        local tracer = c_tracer.new("test",{
+          sampling_rate = sampling_rate,
+        })
+  
+        -- we need to confirm the desired sampling rate is achieved
+        local sample_count = 0
+
+        -- we also need to confirm the sampler have the same output for the same input
+        local result = {}
+
+        local function gen_id()
+          return rand_bytes(len)
+        end
+
+        -- for cases where the traceID is too short
+        -- just throw an error
+        if len < SAMPLING_BYTE then
+          assert.error(function()
+            tracer.sampler(gen_id())
+          end)
+          return
+        end
+  
+        for i = 1, TEST_COUNT do
+          local trace_id = gen_id()
+          local sampled = tracer.sampler(trace_id)
+          if sampled then
+            sample_count = sample_count + 1
+          end
+          result[trace_id] = sampled
+        end
+        
+        -- confirm the sampling rate
+        local actual_rate = sample_count / TEST_COUNT
+        assert_sample_rate(actual_rate, sampling_rate)
+
+        -- only verify 100 times so the test won't take too long
+        local verified_count = 0
+        -- confirm the sampler is deterministic
+        for k, v in pairs(result) do
+          assert.same(v, tracer.sampler(k))
+          verified_count = verified_count + 1
+          if verified_count > 100 then
+            break
+          end
+        end
+      end)
+    end
   end)
 
 end)

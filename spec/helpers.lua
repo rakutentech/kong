@@ -904,13 +904,13 @@ end
 -- @param timeout (optional, number) the timeout to use
 -- @param forced_port (optional, number) if provided will override the port in
 -- the Kong configuration with this port
-local function proxy_client(timeout, forced_port)
+local function proxy_client(timeout, forced_port, forced_ip)
   local proxy_ip = get_proxy_ip(false)
   local proxy_port = get_proxy_port(false)
   assert(proxy_ip, "No http-proxy found in the configuration")
   return http_client_opts({
     scheme = "http",
-    host = proxy_ip,
+    host = forced_ip or proxy_ip,
     port = forced_port or proxy_port,
     timeout = timeout or 60000,
   })
@@ -1287,6 +1287,9 @@ end
 
 
 --- Starts a local HTTP server.
+--
+-- **DEPRECATED**: please use an `http_mock` instead (see example at `start_kong`).
+--
 -- Accepts a single connection and then closes. Sends a 200 ok, 'Connection:
 -- close' response.
 -- If the request received has path `/delay` then the response will be delayed
@@ -1310,15 +1313,16 @@ local function http_server(port, opts)
       assert(server:listen())
       local client = assert(server:accept())
 
+      local content_length
       local lines = {}
       local line, err
       repeat
         line, err = client:receive("*l")
         if err then
           break
-        else
-          table.insert(lines, line)
         end
+        table.insert(lines, line)
+        content_length = tonumber(line:lower():match("^content%-length:%s*(%d+)$")) or content_length
       until line == ""
 
       if #lines > 0 and lines[1] == "GET /delay HTTP/1.0" then
@@ -1330,7 +1334,7 @@ local function http_server(port, opts)
         error(err)
       end
 
-      local body, _ = client:receive("*a")
+      local body, _ = client:receive(content_length or "*a")
 
       client:send("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
       client:close()
@@ -1341,6 +1345,183 @@ local function http_server(port, opts)
   }, port, opts)
 
   return thread:start()
+end
+
+
+local code_status = {
+  [200] = "OK",
+  [201] = "Created",
+  [202] = "Accepted",
+  [203] = "Non-Authoritative Information",
+  [204] = "No Content",
+  [205] = "Reset Content",
+  [206] = "Partial Content",
+  [207] = "Multi-Status",
+  [300] = "Multiple Choices",
+  [301] = "Moved Permanently",
+  [302] = "Found",
+  [303] = "See Other",
+  [304] = "Not Modified",
+  [305] = "Use Proxy",
+  [307] = "Temporary Redirect",
+  [308] = "Permanent Redirect",
+  [400] = "Bad Request",
+  [401] = "Unauthorized",
+  [402] = "Payment Required",
+  [403] = "Forbidden",
+  [404] = "Not Found",
+  [405] = "Method Not Allowed",
+  [406] = "Not Acceptable",
+  [407] = "Proxy Authentication Required",
+  [408] = "Request Timeout",
+  [409] = "Conflict",
+  [410] = "Gone",
+  [411] = "Length Required",
+  [412] = "Precondition Failed",
+  [413] = "Payload Too Large",
+  [414] = "URI Too Long",
+  [415] = "Unsupported Media Type",
+  [416] = "Range Not Satisfiable",
+  [417] = "Expectation Failed",
+  [418] = "I'm a teapot",
+  [422] = "Unprocessable Entity",
+  [423] = "Locked",
+  [424] = "Failed Dependency",
+  [426] = "Upgrade Required",
+  [428] = "Precondition Required",
+  [429] = "Too Many Requests",
+  [431] = "Request Header Fields Too Large",
+  [451] = "Unavailable For Legal Reasons",
+  [500] = "Internal Server Error",
+  [501] = "Not Implemented",
+  [502] = "Bad Gateway",
+  [503] = "Service Unavailable",
+  [504] = "Gateway Timeout",
+  [505] = "HTTP Version Not Supported",
+  [506] = "Variant Also Negotiates",
+  [507] = "Insufficient Storage",
+  [508] = "Loop Detected",
+  [510] = "Not Extended",
+  [511] = "Network Authentication Required",
+}
+
+
+local EMPTY = {}
+
+
+local function handle_response(code, body, headers)
+  if not code then
+    code = 500
+    body = ""
+    headers = EMPTY
+  end
+
+  local head_str = ""
+
+  for k, v in pairs(headers or EMPTY) do
+    head_str = head_str .. k .. ": " .. v .. "\r\n"
+  end
+
+  return code .. " " .. code_status[code] .. " HTTP/1.1" .. "\r\n" ..
+          "Content-Length: " .. #body .. "\r\n" ..
+          "Connection: close\r\n" ..
+          head_str ..
+          "\r\n" ..
+          body
+end
+
+
+local function handle_request(client, response)
+  local lines = {}
+  local headers = {}
+  local line, err
+
+  local content_length
+  repeat
+    line, err = client:receive("*l")
+    if err then
+      return nil, err
+    else
+      local k, v = line:match("^([^:]+):%s*(.+)$")
+      if k then
+        headers[k] = v
+        if k:lower() == "content-length" then
+          content_length = tonumber(v)
+        end
+      end
+      table.insert(lines, line)
+    end
+  until line == ""
+
+  local method = lines[1]:match("^(%S+)%s+(%S+)%s+(%S+)$")
+  local method_lower = method:lower()
+
+  local body
+  if content_length then
+    body = client:receive(content_length)
+
+  elseif method_lower == "put" or method_lower == "post" then
+    body = client:receive("*a")
+  end
+
+  local response_str
+  local meta = getmetatable(response)
+  if type(response) == "function" or (meta and meta.__call) then
+    response_str = response(lines, body, headers)
+
+  elseif type(response) == "table" and response.code then
+    response_str = handle_response(response.code, response.body, response.headers)
+
+  elseif type(response) == "table" and response[1] then
+    response_str = handle_response(response[1], response[2], response[3])
+
+  elseif type(response) == "string" then
+    response_str = response
+
+  elseif response == nil then
+    response_str = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
+  end
+
+
+  client:send(response_str)
+  return lines, body, headers
+end
+
+
+--- Start a local HTTP server with coroutine.
+-- local mock = helpers.http_mock(1234, { timeout = 0.1 })
+-- wait for a request, and respond with the custom response
+-- the request is returned as the function's return values
+-- return nil, err if error
+-- local lines, body, headers = mock(custom_response)
+-- local lines, body, headers = mock()
+-- mock("closing", true) -- close the server
+local function http_mock(port, opts)
+  local socket = require "socket"
+  local server = assert(socket.tcp())
+  server:settimeout(opts and opts.timeout or 60)
+  assert(server:setoption('reuseaddr', true))
+  assert(server:bind("*", port))
+  assert(server:listen())
+  return coroutine.wrap(function(response, exit)
+    local lines, body, headers
+    -- start listening
+    while not exit do
+      local client, err = server:accept()
+      if err then
+        lines, body = false, err
+
+      else
+        lines, body, headers = handle_request(client, response)
+        client:close()
+      end
+
+      response, exit = coroutine.yield(lines, body, headers)
+    end
+
+    server:close()
+    return true
+  end)
 end
 
 
@@ -1364,7 +1545,7 @@ end
 -- * `n > 1`; returns `data + err`, where `data` will always be a table with the
 --   received packets. So `err` must explicitly be checked for errors.
 -- @function udp_server
--- @tparam[opt=MOCK_UPSTREAM_PORT] number port The port the server will be listening on
+-- @tparam[opt] number port The port the server will be listening on, default: `MOCK_UPSTREAM_PORT`
 -- @tparam[opt=1] number n The number of packets that will be read
 -- @tparam[opt=360] number timeout Timeout per read (default 360)
 -- @return A thread object (from the `llthreads2` Lua package)
@@ -1428,7 +1609,7 @@ end
 
 local say = require "say"
 local luassert = require "luassert.assert"
-
+require("spec.helpers.wait")
 
 --- Waits until a specific condition is met.
 -- The check function will repeatedly be called (with a fixed interval), until
@@ -1447,44 +1628,12 @@ local luassert = require "luassert.assert"
 -- -- wait 10 seconds for a file "myfilename" to appear
 -- helpers.wait_until(function() return file_exist("myfilename") end, 10)
 local function wait_until(f, timeout, step)
-  if type(f) ~= "function" then
-    error("arg #1 must be a function", 2)
-  end
-
-  if timeout ~= nil and type(timeout) ~= "number" then
-    error("arg #2 must be a number", 2)
-  end
-
-  if step ~= nil and type(step) ~= "number" then
-    error("arg #3 must be a number", 2)
-  end
-
-  ngx.update_time()
-
-  timeout = timeout or 5
-  step = step or 0.05
-
-  local tstart = ngx.now()
-  local texp = tstart + timeout
-  local ok, res, err
-
-  repeat
-    ok, res, err = pcall(f)
-    ngx.sleep(step)
-    ngx.update_time()
-  until not ok or res or ngx.now() >= texp
-
-  if not ok then
-    -- report error from `f`, such as assert gone wrong
-    error(tostring(res), 2)
-  elseif not res and err then
-    -- report a failure for `f` to meet its condition
-    -- and eventually an error return value which could be the cause
-    error("wait_until() timeout: " .. tostring(err) .. " (after delay: " .. timeout .. "s)", 2)
-  elseif not res then
-    -- report a failure for `f` to meet its condition
-    error("wait_until() timeout (after delay " .. timeout .. "s)", 2)
-  end
+  luassert.wait_until({
+    condition = "truthy",
+    fn = f,
+    timeout = timeout,
+    step = step,
+  })
 end
 
 
@@ -1501,10 +1650,14 @@ end
 -- @return nothing. It returns when the condition is met, or throws an error
 -- when it times out.
 local function pwait_until(f, timeout, step)
-  wait_until(function()
-    return pcall(f)
-  end, timeout, step)
+  luassert.wait_until({
+    condition = "no_error",
+    fn = f,
+    timeout = timeout,
+    step = step,
+  })
 end
+
 
 --- Wait for some timers, throws an error on timeout.
 --
@@ -1523,9 +1676,9 @@ end
 -- all-running: All timers that were matched are running
 --
 -- worker-wide-all-finish: All the timers in the worker that were matched finished
--- @tparam[opt=2] number timeout maximum time to wait
--- @tparam[opt] number admin_client_timeout, to override the default timeout setting
--- @tparam[opt] number forced_admin_port to override the default port of admin API
+-- @tparam number timeout maximum time to wait (optional, default: 2)
+-- @tparam number admin_client_timeout, to override the default timeout setting (optional)
+-- @tparam number forced_admin_port to override the default port of admin API (optional)
 -- @usage helpers.wait_timer("rate-limiting", true, "all-finish", 10)
 local function wait_timer(timer_name_pattern, plain,
                           mode, timeout,
@@ -1673,14 +1826,16 @@ end
 -- NOTE: this function is not available for DBless-mode
 -- @function wait_for_all_config_update
 -- @tparam[opt] table opts a table contains params
--- @tparam[opt=30] number timeout maximum seconds to wait, defatuls is 30
--- @tparam[opt] number admin_client_timeout to override the default timeout setting
--- @tparam[opt] number forced_admin_port to override the default Admin API port
--- @tparam[opt] number proxy_client_timeout to override the default timeout setting
--- @tparam[opt] number forced_proxy_port to override the default proxy port
--- @tparam[opt=false] boolean override_global_rate_limiting_plugin to override the global rate-limiting plugin in waiting
--- @tparam[opt=false] boolean override_global_key_auth_plugin to override the global key-auth plugin in waiting
--- @usage helpers.wait_for_all_config_update()
+-- @tparam[opt=30] number opts.timeout maximum seconds to wait, defatuls is 30
+-- @tparam[opt] number opts.admin_client_timeout to override the default timeout setting
+-- @tparam[opt] number opts.forced_admin_port to override the default Admin API port
+-- @tparam[opt] bollean opts.stream_enabled to enable stream module
+-- @tparam[opt] number opts.proxy_client_timeout to override the default timeout setting
+-- @tparam[opt] number opts.forced_proxy_port to override the default proxy port
+-- @tparam[opt] number opts.stream_port to set the stream port
+-- @tparam[opt] string opts.stream_ip to set the stream ip
+-- @tparam[opt=false] boolean opts.override_global_rate_limiting_plugin to override the global rate-limiting plugin in waiting
+-- @tparam[opt=false] boolean opts.override_global_key_auth_plugin to override the global key-auth plugin in waiting
 local function wait_for_all_config_update(opts)
   opts = opts or {}
   local timeout = opts.timeout or 30
@@ -1688,6 +1843,9 @@ local function wait_for_all_config_update(opts)
   local forced_admin_port = opts.forced_admin_port
   local proxy_client_timeout = opts.proxy_client_timeout
   local forced_proxy_port = opts.forced_proxy_port
+  local stream_port = opts.stream_port
+  local stream_ip = opts.stream_ip
+  local stream_enabled = opts.stream_enabled or false
   local override_rl = opts.override_global_rate_limiting_plugin or false
   local override_auth = opts.override_global_key_auth_plugin or false
 
@@ -1726,9 +1884,12 @@ local function wait_for_all_config_update(opts)
   end
 
   local upstream_id, target_id, service_id, route_id
+  local stream_upstream_id, stream_target_id, stream_service_id, stream_route_id
   local consumer_id, rl_plugin_id, key_auth_plugin_id, credential_id
   local upstream_name = "really.really.really.really.really.really.really.mocking.upstream.com"
   local service_name = "really-really-really-really-really-really-really-mocking-service"
+  local stream_upstream_name = "stream-really.really.really.really.really.really.really.mocking.upstream.com"
+  local stream_service_name = "stream-really-really-really-really-really-really-really-mocking-service"
   local route_path = "/really-really-really-really-really-really-really-mocking-route"
   local key_header_name = "really-really-really-really-really-really-really-mocking-key"
   local consumer_name = "really-really-really-really-really-really-really-mocking-consumer"
@@ -1787,18 +1948,48 @@ local function wait_for_all_config_update(opts)
     key_auth_plugin_id = res.id
 
     -- create consumer
-  res = assert(call_admin_api("POST",
-                              "/consumers",
-                              { username = consumer_name },
-                              201))
-    consumer_id = res.id
+    res = assert(call_admin_api("POST",
+                                "/consumers",
+                                { username = consumer_name },
+                                201))
+      consumer_id = res.id
 
-  -- create credential to key-auth plugin
-  res = assert(call_admin_api("POST",
-                              string.format("/consumers/%s/key-auth", consumer_id),
-                              { key = test_credentials },
+    -- create credential to key-auth plugin
+    res = assert(call_admin_api("POST",
+                                string.format("/consumers/%s/key-auth", consumer_id),
+                                { key = test_credentials },
+                                201))
+    credential_id = res.id
+  end
+
+  if stream_enabled then
+      -- create mocking upstream
+    local res = assert(call_admin_api("POST",
+                              "/upstreams",
+                              { name = stream_upstream_name },
                               201))
-  credential_id = res.id
+    stream_upstream_id = res.id
+
+    -- create mocking target to mocking upstream
+    res = assert(call_admin_api("POST",
+                        string.format("/upstreams/%s/targets", stream_upstream_id),
+                        { target = host .. ":" .. port },
+                        201))
+    stream_target_id = res.id
+
+    -- create mocking service to mocking upstream
+    res = assert(call_admin_api("POST",
+                        "/services",
+                        { name = stream_service_name, url = "tcp://" .. stream_upstream_name },
+                        201))
+    stream_service_id = res.id
+
+    -- create mocking route to mocking service
+    res = assert(call_admin_api("POST",
+                        string.format("/services/%s/routes", stream_service_id),
+                        { destinations = { { port = stream_port }, }, protocols = { "tcp" },},
+                        201))
+    stream_route_id = res.id
   end
 
   local ok, err = pcall(function ()
@@ -1817,8 +2008,18 @@ local function wait_for_all_config_update(opts)
       proxy:close()
       assert(ok, err)
     end, timeout / 2)
-  end)
 
+    if stream_enabled then
+      pwait_until(function ()
+        local proxy = proxy_client(proxy_client_timeout, stream_port, stream_ip)
+  
+        res = proxy:get("/always_200")
+        local ok, err = pcall(assert, res.status == 200)
+        proxy:close()
+        assert(ok, err)
+      end, timeout)
+    end
+  end)
   if not ok then
     server:shutdown()
     error(err)
@@ -1839,6 +2040,13 @@ local function wait_for_all_config_update(opts)
   call_admin_api("DELETE", "/services/" .. service_id, nil, 204)
   call_admin_api("DELETE", string.format("/upstreams/%s/targets/%s", upstream_id, target_id), nil, 204)
   call_admin_api("DELETE", "/upstreams/" .. upstream_id, nil, 204)
+
+  if stream_enabled then
+    call_admin_api("DELETE", "/routes/" .. stream_route_id, nil, 204)
+    call_admin_api("DELETE", "/services/" .. stream_service_id, nil, 204)
+    call_admin_api("DELETE", string.format("/upstreams/%s/targets/%s", stream_upstream_id, stream_target_id), nil, 204)
+    call_admin_api("DELETE", "/upstreams/" .. stream_upstream_id, nil, 204)
+  end
 
   ok, err = pcall(function ()
     -- wait for mocking configurations to be deleted
@@ -2573,6 +2781,55 @@ do
 end
 
 
+--- Assertion to check whether a string matches a regular expression
+-- @function match_re
+-- @param string the string
+-- @param regex the regular expression
+-- @return true or false
+-- @usage
+-- assert.match_re("foobar", [[bar$]])
+--
+
+local function match_re(_, args)
+  local string = args[1]
+  local regex = args[2]
+  assert(type(string) == "string",
+    "Expected the string argument to be a string")
+  assert(type(regex) == "string",
+    "Expected the regex argument to be a string")
+  local from, _, err = ngx.re.find(string, regex)
+  if err then
+    error(err)
+  end
+  if from then
+    table.insert(args, 1, string)
+    table.insert(args, 1, regex)
+    args.n = 2
+    return true
+  else
+    return false
+  end
+end
+
+say:set("assertion.match_re.negative", unindent [[
+    Expected log:
+    %s
+    To match:
+    %s
+  ]])
+say:set("assertion.match_re.positive", unindent [[
+    Expected log:
+    %s
+    To not match:
+    %s
+    But matched line:
+    %s
+  ]])
+luassert:register("assertion", "match_re", match_re,
+  "assertion.match_re.negative",
+  "assertion.match_re.positive")
+
+
 ----------------
 -- DNS-record mocking.
 -- These function allow to create mock dns records that the test Kong instance
@@ -3240,14 +3497,36 @@ local function start_kong(env, tables, preserve_prefix, fixtures)
 end
 
 
+-- Cleanup after kong test instance, should be called if start_kong was invoked with the nowait flag
+-- @function cleanup_kong
+-- @param prefix (optional) the prefix where the test instance runs, defaults to the test configuration.
+-- @param preserve_prefix (boolean) if truthy, the prefix will not be deleted after stopping
+-- @param preserve_dc ???
+local function cleanup_kong(prefix, preserve_prefix, preserve_dc)
+
+  -- note: set env var "KONG_TEST_DONT_CLEAN" !! the "_TEST" will be dropped
+  if not (preserve_prefix or os.getenv("KONG_DONT_CLEAN")) then
+    clean_prefix(prefix)
+  end
+
+  if not preserve_dc then
+    config_yml = nil
+  end
+  ngx.ctx.workspace = nil
+end
+
+
 -- Stop the Kong test instance.
 -- @function stop_kong
 -- @param prefix (optional) the prefix where the test instance runs, defaults to the test configuration.
 -- @param preserve_prefix (boolean) if truthy, the prefix will not be deleted after stopping
--- @param preserve_dc
+-- @param preserve_dc ???
+-- @param signal (optional string) signal name to send to kong, defaults to TERM
+-- @param nowait (optional) if truthy, don't wait for kong to terminate.  caller needs to wait and call cleanup_kong
 -- @return true or nil+err
-local function stop_kong(prefix, preserve_prefix, preserve_dc)
+local function stop_kong(prefix, preserve_prefix, preserve_dc, signal, nowait)
   prefix = prefix or conf.prefix
+  signal = signal or "TERM"
 
   local running_conf, err = get_running_conf(prefix)
   if not running_conf then
@@ -3259,26 +3538,21 @@ local function stop_kong(prefix, preserve_prefix, preserve_dc)
     return nil, err
   end
 
-  local ok, _, _, err = pl_utils.executeex("kill -TERM " .. pid)
+  local ok, _, _, err = pl_utils.executeex(string.format("kill -%s %d", signal, pid))
   if not ok then
     return nil, err
   end
 
+  if nowait then
+    return running_conf.nginx_pid
+  end
+
   wait_pid(running_conf.nginx_pid)
 
-  -- note: set env var "KONG_TEST_DONT_CLEAN" !! the "_TEST" will be dropped
-  if not (preserve_prefix or os.getenv("KONG_DONT_CLEAN")) then
-    clean_prefix(prefix)
-  end
-
-  if not preserve_dc then
-    config_yml = nil
-  end
-  ngx.ctx.workspace = nil
+  cleanup_kong(prefix, preserve_prefix, preserve_dc)
 
   return true
 end
-
 
 --- Restart Kong. Reusing declarative config when using `database=off`.
 -- @function restart_kong
@@ -3388,7 +3662,7 @@ local function clustering_client(opts)
     ssl_verify = false, -- needed for busted tests as CP certs are not trusted by the CLI
     client_cert = assert(ssl.parse_pem_cert(assert(pl_file.read(opts.cert)))),
     client_priv_key = assert(ssl.parse_pem_priv_key(assert(pl_file.read(opts.cert_key)))),
-    server_name = "kong_clustering",
+    server_name = opts.server_name or "kong_clustering",
   }
 
   local res, err = c:connect(uri, conn_opts)
@@ -3398,6 +3672,7 @@ local function clustering_client(opts)
   local payload = assert(cjson.encode({ type = "basic_info",
                                         plugins = opts.node_plugins_list or
                                                   PLUGINS_LIST,
+                                        labels = opts.node_labels,
                                       }))
   assert(c:send_binary(payload))
 
@@ -3562,6 +3837,7 @@ end
   udp_server = udp_server,
   kill_tcp_server = kill_tcp_server,
   http_server = http_server,
+  http_mock = http_mock,
   kill_http_server = kill_http_server,
   get_proxy_ip = get_proxy_ip,
   get_proxy_port = get_proxy_port,
@@ -3596,6 +3872,7 @@ end
   -- launching Kong subprocesses
   start_kong = start_kong,
   stop_kong = stop_kong,
+  cleanup_kong = cleanup_kong,
   restart_kong = restart_kong,
   reload_kong = reload_kong,
   get_kong_workers = get_kong_workers,

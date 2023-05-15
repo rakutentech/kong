@@ -283,7 +283,7 @@ end
 -- `boolean`: can be "on"/"off"/"true"/"false", will be inferred to a boolean
 -- `ngx_boolean`: can be "on"/"off", will be inferred to a string
 -- `array`: a comma-separated list
-local CONF_INFERENCES = {
+local CONF_PARSERS = {
   -- forced string inferences (or else are retrieved as numbers)
   port_maps = { typ = "array" },
   proxy_listen = { typ = "array" },
@@ -325,6 +325,7 @@ local CONF_INFERENCES = {
   upstream_keepalive_pool_size = { typ = "number" },
   upstream_keepalive_max_requests = { typ = "number" },
   upstream_keepalive_idle_timeout = { typ = "number" },
+  allow_debug_header = { typ = "boolean" },
 
   headers = { typ = "array" },
   trusted_ips = { typ = "array" },
@@ -359,6 +360,7 @@ local CONF_INFERENCES = {
   pg_keepalive_timeout = { typ = "number" },
   pg_pool_size = { typ = "number" },
   pg_backlog = { typ = "number" },
+  _debug_pg_ttl_cleanup_interval = { typ = "number" },
 
   pg_ro_port = { typ = "number" },
   pg_ro_timeout = { typ = "number" },
@@ -449,6 +451,11 @@ local CONF_INFERENCES = {
   },
   worker_state_update_frequency = { typ = "number" },
 
+  lua_max_req_headers = { typ = "number" },
+  lua_max_resp_headers = { typ = "number" },
+  lua_max_uri_args = { typ = "number" },
+  lua_max_post_args = { typ = "number" },
+
   ssl_protocols = {
     typ = "string",
     directives = {
@@ -484,6 +491,7 @@ local CONF_INFERENCES = {
       "nginx_stream_ssl_session_timeout",
     },
   },
+  ssl_session_cache_size = { typ = "string" },
 
   client_ssl = { typ = "boolean" },
 
@@ -532,6 +540,7 @@ local CONF_INFERENCES = {
   cluster_ocsp = { enum = { "on", "off", "optional" } },
   cluster_max_payload = { typ = "number" },
   cluster_use_proxy = { typ = "boolean" },
+  cluster_dp_labels = { typ = "array" },
 
   kic = { typ = "boolean" },
   pluginserver_names = { typ = "array" },
@@ -540,18 +549,44 @@ local CONF_INFERENCES = {
   untrusted_lua_sandbox_requires = { typ = "array" },
   untrusted_lua_sandbox_environment = { typ = "array" },
 
-  legacy_worker_events = { typ = "boolean" },
-
   lmdb_environment_path = { typ = "string" },
   lmdb_map_size = { typ = "string" },
 
-  opentelemetry_tracing = { typ = "array" },
-  opentelemetry_tracing_sampling_rate = { typ = "number" },
+  opentelemetry_tracing = {
+    typ = "array",
+    alias = {
+      replacement = "tracing_instrumentations",
+    },
+    deprecated = {
+      replacement = "tracing_instrumentations",
+    },
+  },
+
+  tracing_instrumentations = {
+    typ = "array",
+  },
+
+  opentelemetry_tracing_sampling_rate = {
+    typ = "number",
+    deprecated = {
+      replacement = "tracing_sampling_rate",
+    },
+    alias = {
+      replacement = "tracing_sampling_rate",
+    },
+  },
+
+  tracing_sampling_rate = {
+    typ = "number",
+  },
 
   proxy_server = { typ = "string" },
   proxy_server_ssl_verify = { typ = "boolean" },
 
-  max_queued_batches = { typ = "number" },
+  error_template_html = { typ = "string" },
+  error_template_json = { typ = "string" },
+  error_template_xml = { typ = "string" },
+  error_template_plain = { typ = "string" },
 }
 
 
@@ -588,15 +623,8 @@ local _nop_tostring_mt = {
 }
 
 
-local function infer_value(value, typ, opts)
+local function parse_value(value, typ)
   if type(value) == "string" then
-    if not opts.from_kong_env then
-      -- remove trailing comment, if any
-      -- and remove escape chars from octothorpes
-      value = gsub(value, "[^\\]#.-$", "")
-      value = gsub(value, "\\#", "#")
-    end
-
     value = strip(value)
   end
 
@@ -638,13 +666,13 @@ end
 
 -- Validate properties (type/enum/custom) and infer their type.
 -- @param[type=table] conf The configuration table to treat.
-local function check_and_infer(conf, opts)
+local function check_and_parse(conf, opts)
   local errors = {}
 
   for k, value in pairs(conf) do
-    local v_schema = CONF_INFERENCES[k] or {}
+    local v_schema = CONF_PARSERS[k] or {}
 
-    value = infer_value(value, v_schema.typ, opts)
+    value = parse_value(value, v_schema.typ)
 
     local typ = v_schema.typ or "string"
     if value and not typ_checks[typ](value) then
@@ -1096,6 +1124,10 @@ local function check_and_infer(conf, opts)
       errors[#errors + 1] = "cluster_use_proxy can not be used when role = \"control_plane\""
     end
 
+    if conf.cluster_dp_labels and #conf.cluster_dp_labels > 0 then
+      errors[#errors + 1] = "cluster_dp_labels can not be used when role = \"control_plane\""
+    end
+
   elseif conf.role == "data_plane" then
     if #conf.proxy_listen < 1 or strip(conf.proxy_listen[1]) == "off" then
       errors[#errors + 1] = "proxy_listen must be specified when role = \"data_plane\""
@@ -1113,12 +1145,24 @@ local function check_and_infer(conf, opts)
     if conf.cluster_mtls == "shared" then
       insert(conf.lua_ssl_trusted_certificate, conf.cluster_cert)
 
-    elseif conf.cluster_mtls == "pki" then
+    elseif conf.cluster_mtls == "pki" or conf.cluster_mtls == "pki_check_cn" then
       insert(conf.lua_ssl_trusted_certificate, conf.cluster_ca_cert)
     end
 
     if conf.cluster_use_proxy and not conf.proxy_server then
       errors[#errors + 1] = "cluster_use_proxy is turned on but no proxy_server is configured"
+    end
+
+    if conf.cluster_dp_labels then
+      local _, err = utils.validate_labels(conf.cluster_dp_labels)
+      if err then
+       errors[#errors + 1] = err
+      end
+    end
+
+  else
+    if conf.cluster_dp_labels and #conf.cluster_dp_labels > 0 then
+      errors[#errors + 1] = "cluster_dp_labels can only be used when role = \"data_plane\""
     end
   end
 
@@ -1181,28 +1225,56 @@ local function check_and_infer(conf, opts)
     errors[#errors + 1] = "upstream_keepalive_idle_timeout must be 0 or greater"
   end
 
-  if conf.opentelemetry_tracing and #conf.opentelemetry_tracing > 0 then
+  if conf.tracing_instrumentations and #conf.tracing_instrumentations > 0 then
     local instrumentation = require "kong.tracing.instrumentation"
     local available_types_map = tablex.deepcopy(instrumentation.available_types)
     available_types_map["all"] = true
     available_types_map["off"] = true
     available_types_map["request"] = true
 
-    for _, trace_type in ipairs(conf.opentelemetry_tracing) do
+    for _, trace_type in ipairs(conf.tracing_instrumentations) do
       if not available_types_map[trace_type] then
-        errors[#errors + 1] = "invalid opentelemetry tracing type: " .. trace_type
+        errors[#errors + 1] = "invalid tracing type: " .. trace_type
       end
     end
 
-    if #conf.opentelemetry_tracing > 1
-      and tablex.find(conf.opentelemetry_tracing, "off")
+    if #conf.tracing_instrumentations > 1
+      and tablex.find(conf.tracing_instrumentations, "off")
     then
-      errors[#errors + 1] = "invalid opentelemetry tracing types: off, other types are mutually exclusive"
+      errors[#errors + 1] = "invalid tracing types: off, other types are mutually exclusive"
     end
 
-    if conf.opentelemetry_tracing_sampling_rate < 0 or conf.opentelemetry_tracing_sampling_rate > 1 then
-      errors[#errors + 1] = "opentelemetry_tracing_sampling_rate must be between 0 and 1"
+    if conf.tracing_sampling_rate < 0 or conf.tracing_sampling_rate > 1 then
+      errors[#errors + 1] = "tracing_sampling_rate must be between 0 and 1"
     end
+  end
+
+  if conf.lua_max_req_headers < 1 or conf.lua_max_req_headers > 1000
+  or conf.lua_max_req_headers ~= floor(conf.lua_max_req_headers)
+  then
+    errors[#errors + 1] = "lua_max_req_headers must be an integer between 1 and 1000"
+  end
+
+  if conf.lua_max_resp_headers < 1 or conf.lua_max_resp_headers > 1000
+  or conf.lua_max_resp_headers ~= floor(conf.lua_max_resp_headers)
+  then
+    errors[#errors + 1] = "lua_max_resp_headers must be an integer between 1 and 1000"
+  end
+
+  if conf.lua_max_uri_args < 1 or conf.lua_max_uri_args > 1000
+  or conf.lua_max_uri_args ~= floor(conf.lua_max_uri_args)
+  then
+    errors[#errors + 1] = "lua_max_uri_args must be an integer between 1 and 1000"
+  end
+
+  if conf.lua_max_post_args < 1 or conf.lua_max_post_args > 1000
+  or conf.lua_max_post_args ~= floor(conf.lua_max_post_args)
+  then
+    errors[#errors + 1] = "lua_max_post_args must be an integer between 1 and 1000"
+  end
+
+  if conf.node_id and not utils.is_valid_uuid(conf.node_id) then
+    errors[#errors + 1] = "node_id must be a valid UUID"
   end
 
   return #errors == 0, errors[1], errors
@@ -1213,7 +1285,6 @@ local function overrides(k, default_v, opts, file_conf, arg_conf)
   opts = opts or {}
 
   local value -- definitive value for this property
-  local escape -- whether to escape a value's octothorpes
 
   -- default values have lowest priority
 
@@ -1244,23 +1315,12 @@ local function overrides(k, default_v, opts, file_conf, arg_conf)
       log.debug('%s ENV found with "%s"', env_name, to_print)
 
       value = env
-      escape = true
     end
   end
 
   -- arg_conf have highest priority
   if arg_conf and arg_conf[k] ~= nil then
     value = arg_conf[k]
-    escape = true
-  end
-
-  if escape and type(value) == "string" then
-    -- Escape "#" in env vars or overrides to avoid them being mangled by
-    -- comments stripping logic.
-    repeat
-      local s, n = gsub(value, [[([^\])#]], [[%1\#]])
-      value = s
-    until n == 0
   end
 
   return value, k
@@ -1289,7 +1349,7 @@ end
 
 
 local function aliased_properties(conf)
-  for property_name, v_schema in pairs(CONF_INFERENCES) do
+  for property_name, v_schema in pairs(CONF_PARSERS) do
     local alias = v_schema.alias
 
     if alias and conf[property_name] ~= nil and conf[alias.replacement] == nil then
@@ -1308,7 +1368,7 @@ end
 
 
 local function deprecated_properties(conf, opts)
-  for property_name, v_schema in pairs(CONF_INFERENCES) do
+  for property_name, v_schema in pairs(CONF_PARSERS) do
     local deprecated = v_schema.deprecated
 
     if deprecated and conf[property_name] ~= nil then
@@ -1334,7 +1394,7 @@ end
 
 
 local function dynamic_properties(conf)
-  for property_name, v_schema in pairs(CONF_INFERENCES) do
+  for property_name, v_schema in pairs(CONF_PARSERS) do
     local value = conf[property_name]
     if value ~= nil then
       local directives = v_schema.directives
@@ -1353,6 +1413,35 @@ local function dynamic_properties(conf)
 end
 
 
+local function load_config(thing)
+  local s = pl_stringio.open(thing)
+  local conf, err = pl_config.read(s, {
+    smart = false,
+    list_delim = "_blank_" -- mandatory but we want to ignore it
+  })
+  s:close()
+  if not conf then
+    return nil, err
+  end
+
+  local function strip_comments(value)
+    -- remove trailing comment, if any
+    -- and remove escape chars from octothorpes
+    if value then
+      value = ngx.re.sub(value, [[\s*(?<!\\)#.*$]], "")
+      value = gsub(value, "\\#", "#")
+    end
+    return value
+  end
+
+  for key, value in pairs(conf) do
+    conf[key] = strip_comments(value)
+  end
+
+  return conf
+end
+
+
 --- Load Kong configuration file
 -- The loaded configuration will only contain properties read from the
 -- passed configuration file (properties are not merged with defaults or
@@ -1366,17 +1455,7 @@ local function load_config_file(path)
     return nil, err
   end
 
-  local s = pl_stringio.open(f)
-  local conf, err = pl_config.read(s, {
-    smart = false,
-    list_delim = "_blank_" -- mandatory but we want to ignore it
-  })
-  s:close()
-  if not conf then
-    return nil, err
-  end
-
-  return conf
+  return load_config(f)
 end
 
 
@@ -1397,12 +1476,7 @@ local function load(path, custom_conf, opts)
   ------------------------
 
   -- load defaults, they are our mandatory base
-  local s = pl_stringio.open(kong_default_conf)
-  local defaults, err = pl_config.read(s, {
-    smart = false,
-    list_delim = "_blank_" -- mandatory but we want to ignore it
-  })
-  s:close()
+  local defaults, err = load_config(kong_default_conf)
   if not defaults then
     return nil, "could not load default conf: " .. err
   end
@@ -1454,7 +1528,7 @@ local function load(path, custom_conf, opts)
     local function add_dynamic_keys(t)
       t = t or {}
 
-      for property_name, v_schema in pairs(CONF_INFERENCES) do
+      for property_name, v_schema in pairs(CONF_PARSERS) do
         local directives = v_schema.directives
         if directives then
           local v = t[property_name]
@@ -1552,7 +1626,7 @@ local function load(path, custom_conf, opts)
   local refs
   do
     -- validation
-    local vaults_array = infer_value(conf.vaults, CONF_INFERENCES["vaults"].typ, opts)
+    local vaults_array = parse_value(conf.vaults, CONF_PARSERS["vaults"].typ)
 
     -- merge vaults
     local vaults = {}
@@ -1596,7 +1670,7 @@ local function load(path, custom_conf, opts)
         end
 
         for k, deref in pairs(secrets) do
-          local v = infer_value(conf[k], "string", opts)
+          local v = parse_value(conf[k], "string")
           if refs then
             refs[k] = v
           else
@@ -1611,14 +1685,14 @@ local function load(path, custom_conf, opts)
       local vault_conf = { loaded_vaults = loaded_vaults }
       for k, v in pairs(conf) do
         if sub(k, 1, 6) == "vault_" then
-          vault_conf[k] = infer_value(v, "string", opts)
+          vault_conf[k] = parse_value(v, "string")
         end
       end
 
       local vault = require("kong.pdk.vault").new({ configuration = vault_conf })
 
       for k, v in pairs(conf) do
-        v = infer_value(v, "string", opts)
+        v = parse_value(v, "string")
         if vault.is_reference(v) then
           if refs then
             refs[k] = v
@@ -1628,10 +1702,11 @@ local function load(path, custom_conf, opts)
 
           local deref, deref_err = vault.get(v)
           if deref == nil or deref_err then
-            return nil, fmt("failed to dereference '%s': %s for config option '%s'", v, deref_err, k)
-          end
+            if opts.starting then
+              return nil, fmt("failed to dereference '%s': %s for config option '%s'", v, deref_err, k)
+            end
 
-          if deref ~= nil then
+          else
             conf[k] = deref
           end
         end
@@ -1640,7 +1715,7 @@ local function load(path, custom_conf, opts)
   end
 
   -- validation
-  local ok, err, errors = check_and_infer(conf, opts)
+  local ok, err, errors = check_and_parse(conf, opts)
 
   if not opts.starting then
     log.enable()
@@ -1932,7 +2007,7 @@ local function load(path, custom_conf, opts)
 
   -- hybrid mode HTTP tunneling (CONNECT) proxy inside HTTPS
   if conf.cluster_use_proxy then
-    -- throw err, assume it's already handled in check_and_infer
+    -- throw err, assume it's already handled in check_and_parse
     local parsed = assert(socket_url.parse(conf.proxy_server))
     if parsed.scheme == "https" then
       conf.cluster_ssl_tunnel = fmt("%s:%s", parsed.host, parsed.port or 443)

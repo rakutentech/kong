@@ -14,8 +14,6 @@ events {}
 
 http {
 > if #proxy_listeners > 0 or #admin_listeners > 0 then
-    charset UTF-8;
-
     error_log logs/error.log ${{LOG_LEVEL}};
 
 > if nginx_optimizations then
@@ -48,7 +46,6 @@ http {
     lua_shared_dict kong_db_cache_miss_2 12m;
 > end
     lua_shared_dict kong_locks          8m;
-    lua_shared_dict kong_process_events 5m;
     lua_shared_dict kong_cluster_events 5m;
     lua_shared_dict kong_healthchecks   5m;
     lua_shared_dict kong_rate_limiting_counters 12m;
@@ -192,6 +189,7 @@ http {
 
 > if #admin_listeners > 0 then
     server {
+        charset UTF-8;
         server_name kong_admin;
 > for i = 1, #admin_listeners do
         listen $(admin_listeners[i].listener);
@@ -487,7 +485,6 @@ stream {
     lua_shared_dict stream_kong_db_cache_miss_2  12m;
 > end
     lua_shared_dict stream_kong_locks          8m;
-    lua_shared_dict stream_kong_process_events 5m;
     lua_shared_dict stream_kong_cluster_events 5m;
     lua_shared_dict stream_kong_healthchecks   5m;
     lua_shared_dict stream_kong_rate_limiting_counters 12m;

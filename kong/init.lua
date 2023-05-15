@@ -88,13 +88,14 @@ local lmdb_txn = require "resty.lmdb.transaction"
 local instrumentation = require "kong.tracing.instrumentation"
 local tablepool = require "tablepool"
 local table_new = require "table.new"
+local utils = require "kong.tools.utils"
+local constants = require "kong.constants"
 local get_ctx_table = require("resty.core.ctx").get_ctx_table
 
 
 local kong             = kong
 local ngx              = ngx
 local now              = ngx.now
-local update_time      = ngx.update_time
 local var              = ngx.var
 local arg              = ngx.arg
 local header           = ngx.header
@@ -123,6 +124,8 @@ local set_current_peer = ngx_balancer.set_current_peer
 local set_timeouts     = ngx_balancer.set_timeouts
 local set_more_tries   = ngx_balancer.set_more_tries
 local enable_keepalive = ngx_balancer.enable_keepalive
+local time_ns          = utils.time_ns
+local get_updated_now_ms = utils.get_updated_now_ms
 
 
 local DECLARATIVE_LOAD_KEY = constants.DECLARATIVE_LOAD_KEY
@@ -204,7 +207,8 @@ local reset_kong_shm
 do
   local preserve_keys = {
     "kong:node_id",
-    "kong:log_level",
+    constants.DYN_LOG_LEVEL_KEY,
+    constants.DYN_LOG_LEVEL_TIMEOUT_AT_KEY,
     "events:requests",
     "events:requests:http",
     "events:requests:https",
@@ -244,13 +248,14 @@ do
 end
 
 
-local function setup_plugin_context(ctx, plugin)
+local function setup_plugin_context(ctx, plugin, conf)
   if plugin.handler._go then
     ctx.ran_go_plugin = true
   end
 
   kong_global.set_named_ctx(kong, "plugin", plugin.handler, ctx)
   kong_global.set_namespaced_log(kong, plugin.name, ctx)
+  ctx.plugin_id = conf.__plugin_id
 end
 
 
@@ -309,7 +314,7 @@ local function execute_global_plugins_iterator(plugins_iterator, phase, ctx)
       span = instrumentation.plugin_rewrite(plugin)
     end
 
-    setup_plugin_context(ctx, plugin)
+    setup_plugin_context(ctx, plugin, configuration)
     plugin.handler[phase](plugin.handler, configuration)
     reset_plugin_context(ctx, old_ws)
 
@@ -340,7 +345,7 @@ local function execute_collecting_plugins_iterator(plugins_iterator, phase, ctx)
         span = instrumentation.plugin_access(plugin)
       end
 
-      setup_plugin_context(ctx, plugin)
+      setup_plugin_context(ctx, plugin, configuration)
 
       local co = coroutine.create(plugin.handler[phase])
       local cok, cerr = coroutine.resume(co, plugin.handler, configuration)
@@ -391,7 +396,7 @@ local function execute_collected_plugins_iterator(plugins_iterator, phase, ctx)
       span = instrumentation.plugin_header_filter(plugin)
     end
 
-    setup_plugin_context(ctx, plugin)
+    setup_plugin_context(ctx, plugin, configuration)
     plugin.handler[phase](plugin.handler, configuration)
     reset_plugin_context(ctx, old_ws)
 
@@ -418,12 +423,6 @@ local function execute_cache_warmup(kong_config)
 end
 
 
-local function get_updated_now_ms()
-  update_time()
-  return now() * 1000 -- time is kept in seconds with millisecond resolution.
-end
-
-
 local function flush_delayed_response(ctx)
   ctx.delay_response = nil
   ctx.buffered_proxying = nil
@@ -433,9 +432,9 @@ local function flush_delayed_response(ctx)
     return -- avoid tail call
   end
 
-  kong.response.exit(ctx.delayed_response.status_code,
-                     ctx.delayed_response.content,
-                     ctx.delayed_response.headers)
+  local dr = ctx.delayed_response
+  local message = dr.content and dr.content.message or dr.content
+  kong.response.error(dr.status_code, message, dr.headers)
 end
 
 
@@ -736,6 +735,8 @@ function Kong.init_worker()
 
   kong.db:set_events_handler(worker_events)
 
+  kong.vault.init_worker()
+
   if is_dbless(kong.configuration) then
     -- databases in LMDB need to be explicitly created, otherwise `get`
     -- operations will return error instead of `nil`. This ensures the default
@@ -1005,7 +1006,7 @@ function Kong.access()
 
     ctx.buffered_proxying = nil
 
-    return kong.response.exit(503, { message = "no Service found with those values"})
+    return kong.response.error(503, "no Service found with those values")
   end
 
   runloop.access.after(ctx)
@@ -1078,6 +1079,7 @@ function Kong.balancer()
   tries[try_count] = current_try
 
   current_try.balancer_start = now_ms
+  current_try.balancer_start_ns = time_ns()
 
   if try_count > 1 then
     -- only call balancer on retry, first one is done in `runloop.access.after`
@@ -1201,6 +1203,7 @@ function Kong.balancer()
   -- record try-latency
   local try_latency = ctx.KONG_BALANCER_ENDED_AT - current_try.balancer_start
   current_try.balancer_latency = try_latency
+  current_try.balancer_latency_ns = time_ns() - current_try.balancer_start_ns
 
   -- time spent in Kong before sending the request to upstream
   -- start_time() is kept in seconds with millisecond resolution.
@@ -1277,6 +1280,12 @@ do
 
     if not ctx.KONG_PROXY_LATENCY then
       ctx.KONG_PROXY_LATENCY = ctx.KONG_RESPONSE_START - ctx.KONG_PROCESSING_START
+    end
+
+    if not ctx.KONG_UPSTREAM_DNS_TIME and ctx.KONG_UPSTREAM_DNS_END_AT and ctx.KONG_UPSTREAM_DNS_START then
+      ctx.KONG_UPSTREAM_DNS_TIME = ctx.KONG_UPSTREAM_DNS_END_AT - ctx.KONG_UPSTREAM_DNS_START
+    else
+      ctx.KONG_UPSTREAM_DNS_TIME = 0
     end
 
     kong.response.set_status(status)

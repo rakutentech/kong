@@ -14,6 +14,7 @@ local re_match = ngx.re.match
 local re_gmatch = ngx.re.gmatch
 
 local encode_json = cjson.encode
+local pcall = pcall
 
 local deco = {}
 deco.__index = deco
@@ -90,8 +91,8 @@ local function get_proto_info(fname)
   local grpc_tools_instance = grpc_tools.new()
   grpc_tools_instance:each_method(fname, function(parsed, srvc, mthd)
     local options_bindings =  {
-      safe_access(mthd, "options", "options", "google.api.http"),
-      safe_access(mthd, "options", "options", "google.api.http", "additional_bindings")
+      safe_access(mthd, "options", "google.api.http"),
+      safe_access(mthd, "options", "google.api.http", "additional_bindings")
     }
     for _, options in ipairs(options_bindings) do
       for http_method, http_path in pairs(options) do
@@ -266,7 +267,17 @@ function deco:upstream(body)
       end
     end
   end
-  body = grpc_frame(0x0, pb.encode(self.endpoint.input_type, payload))
+
+  local pok, msg = pcall(pb.encode, self.endpoint.input_type, payload)
+  if not pok or not msg then
+    if msg then
+      ngx.log(ngx.ERR, msg)
+    end
+    -- should return error msg to client?
+    return nil, "failed to encode payload"
+  end
+
+  body = grpc_frame(0x0, msg)
   return body
 end
 

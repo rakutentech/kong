@@ -27,7 +27,7 @@ local table = table
 local table_concat = table.concat
 local run_hook = hooks.run_hook
 local var = ngx.var
-
+local get_updated_now_ms = utils.get_updated_now_ms
 
 local CRIT = ngx.CRIT
 local ERR = ngx.ERR
@@ -36,10 +36,11 @@ local EMPTY_T = pl_tablex.readonly {}
 
 
 local set_authority
-local set_upstream_cert_and_key
+
+local set_upstream_cert_and_key = require("resty.kong.tls").set_upstream_cert_and_key
+
 if ngx.config.subsystem ~= "stream" then
   set_authority = require("resty.kong.grpc").set_authority
-  set_upstream_cert_and_key = require("resty.kong.tls").set_upstream_cert_and_key
 end
 
 
@@ -47,7 +48,6 @@ local get_query_arg
 do
   local sort = table.sort
   local get_uri_args = ngx.req.get_uri_args
-  local limit = 100
 
   -- OpenResty allows us to reuse the table that it populates with the request
   -- query args. The table is cleared by `ngx.req.get_uri_args` on each use, so
@@ -55,15 +55,22 @@ do
   --
   -- @see https://github.com/openresty/lua-resty-core/pull/288
   -- @see https://github.com/openresty/lua-resty-core/blob/3c3d0786d6e26282e76f39f4fe5577d316a47a09/lib/resty/core/request.lua#L196-L208
-  local cache = require("table.new")(0, limit)
-
+  local cache
+  local limit
 
   function get_query_arg(name)
+    if not limit then
+      limit = kong and kong.configuration and kong.configuration.lua_max_uri_args or 100
+      cache = require("table.new")(0, limit)
+    end
+
     local query, err = get_uri_args(limit, cache)
 
     if err == "truncated" then
       log(WARN, "could not fetch all query string args for request, ",
-                "hash value may be empty/incomplete")
+                "hash value may be empty/incomplete, please consider ",
+                 "increasing the value of 'lua_max_uri_args' ",
+                 "(currently at ",  limit, ")")
 
     elseif not query then
       log(ERR, "failed fetching query string args: ", err or "unknown error")
@@ -346,6 +353,10 @@ local function execute(balancer_data, ctx)
     end
   end
 
+  if not ctx then
+    ctx = ngx.ctx
+  end
+  ctx.KONG_UPSTREAM_DNS_START = get_updated_now_ms()
   local ip, port, hostname, handle
   if balancer then
     -- have to invoke the ring-balancer
@@ -368,6 +379,9 @@ local function execute(balancer_data, ctx)
     local try_list
     local hstate = run_hook("balancer:to_ip:pre", balancer_data.host)
     ip, port, try_list = toip(balancer_data.host, balancer_data.port, dns_cache_only)
+    if not dns_cache_only then
+      ctx.KONG_UPSTREAM_DNS_END_AT = get_updated_now_ms()
+    end
     run_hook("balancer:to_ip:post", hstate)
     hostname = balancer_data.host
     if not ip then
@@ -466,11 +480,17 @@ local function set_host_header(balancer_data, upstream_scheme, upstream_host, is
   return true
 end
 
-
+local function after_balance(balancer_data, ctx)
+  if balancer_data and balancer_data.balancer_handle then
+    local balancer = balancer_data.balancer
+    balancer:afterBalance(ctx, balancer_data.balancer_handle)
+  end
+end
 
 return {
   init = init,
   execute = execute,
+  after_balance = after_balance,
   on_target_event = targets.on_target_event,
   on_upstream_event = upstreams.on_upstream_event,
   get_upstream_by_name = upstreams.get_upstream_by_name,

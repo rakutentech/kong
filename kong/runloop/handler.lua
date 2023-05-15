@@ -11,7 +11,8 @@ local certificate  = require "kong.runloop.certificate"
 local concurrency  = require "kong.concurrency"
 local lrucache     = require "resty.lrucache"
 local marshall     = require "kong.cache.marshall"
-
+local ktls         = require "resty.kong.tls"
+local cjson        = require "cjson"
 
 local PluginsIterator = require "kong.runloop.plugins_iterator"
 local instrumentation = require "kong.tracing.instrumentation"
@@ -48,8 +49,15 @@ local escape            = require("kong.tools.uri").escape
 local is_http_module   = subsystem == "http"
 local is_stream_module = subsystem == "stream"
 
-
+local LOG_LEVELS                  = require("kong.constants").LOG_LEVELS
 local DEFAULT_MATCH_LRUCACHE_SIZE = Router.DEFAULT_MATCH_LRUCACHE_SIZE
+
+
+local kong_shm          = ngx.shared.kong
+local PLUGINS_REBUILD_COUNTER_KEY = 
+                                constants.PLUGINS_REBUILD_COUNTER_KEY
+local ROUTERS_REBUILD_COUNTER_KEY = 
+                                constants.ROUTERS_REBUILD_COUNTER_KEY
 
 
 local ROUTER_CACHE_SIZE = DEFAULT_MATCH_LRUCACHE_SIZE
@@ -70,7 +78,6 @@ local COMMA = byte(",")
 local SPACE = byte(" ")
 local QUESTION_MARK = byte("?")
 local ARRAY_MT = require("cjson.safe").array_mt
-local get_sys_filter_level = require("ngx.errlog").get_sys_filter_level
 
 local HOST_PORTS = {}
 
@@ -96,26 +103,24 @@ local STREAM_TLS_TERMINATE_SOCK
 local STREAM_TLS_PASSTHROUGH_SOCK
 
 
-local set_upstream_cert_and_key
-local set_upstream_ssl_verify
-local set_upstream_ssl_verify_depth
-local set_upstream_ssl_trusted_store
 local set_authority
 local set_log_level
+local get_log_level
+local set_upstream_cert_and_key = ktls.set_upstream_cert_and_key
+local set_upstream_ssl_verify = ktls.set_upstream_ssl_verify
+local set_upstream_ssl_verify_depth = ktls.set_upstream_ssl_verify_depth
+local set_upstream_ssl_trusted_store = ktls.set_upstream_ssl_trusted_store
+
 if is_http_module then
-  local tls = require("resty.kong.tls")
-  set_upstream_cert_and_key = tls.set_upstream_cert_and_key
-  set_upstream_ssl_verify = tls.set_upstream_ssl_verify
-  set_upstream_ssl_verify_depth = tls.set_upstream_ssl_verify_depth
-  set_upstream_ssl_trusted_store = tls.set_upstream_ssl_trusted_store
   set_authority = require("resty.kong.grpc").set_authority
   set_log_level = require("resty.kong.log").set_log_level
+  get_log_level = require("resty.kong.log").get_log_level
 end
 
 
 local disable_proxy_ssl
 if is_stream_module then
-  disable_proxy_ssl = require("resty.kong.tls").disable_proxy_ssl
+  disable_proxy_ssl = ktls.disable_proxy_ssl
 end
 
 
@@ -401,6 +406,11 @@ local function new_router(version)
     return nil, "could not create router: " .. err
   end
 
+  local _, err = kong_shm:incr(ROUTERS_REBUILD_COUNTER_KEY, 1, 0)
+  if err then
+    log(ERR, "failed to increase router rebuild counter: ", err)
+  end
+
   return new_router
 end
 
@@ -482,7 +492,23 @@ local function _set_router_version(v)
 end
 
 
-local new_plugins_iterator = PluginsIterator.new
+local new_plugins_iterator
+do
+  local PluginsIterator_new = PluginsIterator.new
+  new_plugins_iterator = function(version) 
+    local plugin_iterator, err = PluginsIterator_new(version)
+    if not plugin_iterator then
+      return nil, err
+    end
+
+    local _, err = kong_shm:incr(PLUGINS_REBUILD_COUNTER_KEY, 1, 0)
+    if err then
+      log(ERR, "failed to increase plugins rebuild counter: ", err)
+    end
+
+    return plugin_iterator
+  end
+end
 
 
 local function build_plugins_iterator(version)
@@ -635,6 +661,7 @@ do
 
       kong.core_cache:purge()
       kong.cache:purge()
+      kong.vault.flush()
 
       if router then
         ROUTER = router
@@ -731,7 +758,7 @@ do
     ctx.route            = route
     ctx.balancer_data    = balancer_data
 
-    if is_http_module and service then
+    if service then
       local res, err
       local client_certificate = service.client_certificate
 
@@ -863,10 +890,11 @@ return {
       if is_http_module then
         -- if worker has outdated log level (e.g. newly spawned), updated it
         timer_at(0, function()
-          local cur_log_level = get_sys_filter_level()
-          local shm_log_level = ngx.shared.kong:get("kong:log_level")
-          if cur_log_level and shm_log_level and cur_log_level ~= shm_log_level then
-            local ok, err = pcall(set_log_level, shm_log_level)
+          local cur_log_level = get_log_level(LOG_LEVELS[kong.configuration.log_level])
+          local shm_log_level = ngx.shared.kong:get(constants.DYN_LOG_LEVEL_KEY)
+          local timeout = (tonumber(ngx.shared.kong:get(constants.DYN_LOG_LEVEL_TIMEOUT_AT_KEY)) or 0) - ngx.time()
+          if shm_log_level and cur_log_level ~= shm_log_level and timeout > 0 then
+            local ok, err = pcall(set_log_level, shm_log_level, timeout)
             if not ok then
               local worker = ngx.worker.id()
               log(ERR, "worker" , worker, " failed setting log level: ", err)
@@ -883,7 +911,7 @@ return {
             return
           end
 
-          local ok, err = kong.worker_events.post("debug", "log_level", tonumber(data))
+          local ok, err = kong.worker_events.post("debug", "log_level", cjson.decode(data))
 
           if not ok then
             kong.log.err("failed broadcasting to workers: ", err)
@@ -899,7 +927,7 @@ return {
 
           log(NOTICE, "log level worker event received for worker ", worker)
 
-          local ok, err = pcall(set_log_level, data)
+          local ok, err = pcall(set_log_level, data.log_level, data.timeout)
 
           if not ok then
             log(ERR, "worker ", worker, " failed setting log level: ", err)
@@ -915,10 +943,9 @@ return {
       end
 
       if kong.configuration.anonymous_reports then
-        reports.configure_ping(kong.configuration)
+        reports.init(kong.configuration)
         reports.add_ping_value("database_version", kong.db.infos.db_ver)
-        reports.toggle(true)
-        reports.init_worker()
+        reports.init_worker(kong.configuration)
       end
 
       update_lua_mem(true)
@@ -1078,12 +1105,12 @@ return {
                        upstream_url_t.host,
                        upstream_url_t.port,
                        service, route)
+      var.upstream_host = upstream_url_t.host
     end,
     after = function(ctx)
       local ok, err, errcode = balancer_execute(ctx)
       if not ok then
-        local body = utils.get_default_exit_body(errcode, err)
-        return kong.response.exit(errcode, body)
+        return kong.response.error(errcode, err)
       end
     end
   },
@@ -1121,7 +1148,7 @@ return {
           span:finish()
         end
 
-        return kong.response.exit(404, { message = "no Route matched with those values" })
+        return kong.response.error(404, "no Route matched with those values")
       end
 
       -- ends tracing span
@@ -1188,7 +1215,7 @@ return {
         local redirect_status_code = route.https_redirect_status_code or 426
 
         if redirect_status_code == 426 then
-          return kong.response.exit(426, { message = "Please use HTTPS protocol" }, {
+          return kong.response.error(426, "Please use HTTPS protocol", {
             ["Connection"] = "Upgrade",
             ["Upgrade"]    = "TLS/1.2, HTTP/1.1",
           })
@@ -1212,7 +1239,7 @@ return {
         if content_type and sub(content_type, 1, #"application/grpc") == "application/grpc" then
           if protocol_version ~= 2 then
             -- mismatch: non-http/2 request matched grpc route
-            return kong.response.exit(426, { message = "Please use HTTP2 protocol" }, {
+            return kong.response.error(426, "Please use HTTP2 protocol", {
               ["connection"] = "Upgrade",
               ["upgrade"]    = "HTTP/2",
             })
@@ -1220,7 +1247,7 @@ return {
 
         else
           -- mismatch: non-grpc request matched grpc route
-          return kong.response.exit(415, { message = "Non-gRPC request matched gRPC route" })
+          return kong.response.error(415, "Non-gRPC request matched gRPC route")
         end
 
         if not protocols.grpc and forwarded_proto ~= "https" then
@@ -1284,18 +1311,16 @@ return {
           return exec("@grpc")
         end
 
-        if protocol_version == 1.1 then
-          if route.request_buffering == false then
-            if route.response_buffering == false then
-              return exec("@unbuffered")
-            end
-
-            return exec("@unbuffered_request")
-          end
-
+        if route.request_buffering == false then
           if route.response_buffering == false then
-            return exec("@unbuffered_response")
+            return exec("@unbuffered")
           end
+
+          return exec("@unbuffered_request")
+        end
+
+        if route.response_buffering == false then
+          return exec("@unbuffered_response")
         end
       end
     end,
@@ -1342,8 +1367,7 @@ return {
 
       local ok, err, errcode = balancer_execute(ctx)
       if not ok then
-        local body = utils.get_default_exit_body(errcode, err)
-        return kong.response.exit(errcode, body)
+        return kong.response.error(errcode, err)
       end
 
       local ok, err = balancer.set_host_header(balancer_data, upstream_scheme, upstream_host)
@@ -1433,7 +1457,8 @@ return {
 
       local upstream_status_header = constants.HEADERS.UPSTREAM_STATUS
       if kong.configuration.enabled_headers[upstream_status_header] then
-        header[upstream_status_header] = tonumber(sub(var.upstream_status or "", -3))
+        local upstream_status = ctx.buffered_status or tonumber(sub(var.upstream_status or "", -3))
+        header[upstream_status_header] = upstream_status
         if not header[upstream_status_header] then
           log(ERR, "failed to set ", upstream_status_header, " header")
         end
@@ -1451,6 +1476,8 @@ return {
           current_try.code = status
         end
       end
+
+      instrumentation.runloop_before_header_filter(status)
 
       local hash_cookie = ctx.balancer_data.hash_cookie
       if hash_cookie then
@@ -1513,7 +1540,10 @@ return {
       -- Report HTTP status for health checks
       local balancer_data = ctx.balancer_data
       if balancer_data and balancer_data.balancer_handle then
-        local status = ngx.status
+        -- https://nginx.org/en/docs/http/ngx_http_upstream_module.html#variables
+        -- because of the way of Nginx do the upstream_status variable, it may be
+        -- a string or a number, so we need to parse it to get the status
+        local status = tonumber(ctx.buffered_status) or tonumber(sub(var.upstream_status or "", -3)) or ngx.status
         if status == 504 then
           balancer_data.balancer.report_timeout(balancer_data.balancer_handle)
         else
@@ -1525,6 +1555,7 @@ return {
           balancer_data.balancer_handle:release()
         end
       end
+      balancer.after_balance(balancer_data, ctx)
     end
   }
 }

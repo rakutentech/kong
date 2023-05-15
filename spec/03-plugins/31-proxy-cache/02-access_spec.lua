@@ -71,12 +71,28 @@ do
       local route14 = assert(bp.routes:insert {
         hosts = { "route-14.com" },
       })
-      local route15 = assert(bp.routes:insert({
+      local route15 = assert(bp.routes:insert {
         hosts = { "route-15.com" },
-      }))
-      local route16 = assert(bp.routes:insert({
+      })
+      local route16 = assert(bp.routes:insert {
         hosts = { "route-16.com" },
-      }))
+      })
+      local route17 = assert(bp.routes:insert {
+        hosts = { "route-17.com" },
+      })
+      local route18 = assert(bp.routes:insert {
+        hosts = { "route-18.com" },
+      })
+      local route19 = assert(bp.routes:insert {
+        hosts = { "route-19.com" },
+      })
+      local route20 = assert(bp.routes:insert {
+        hosts = { "route-20.com" },
+      })
+      local route21 = assert(bp.routes:insert {
+        hosts = { "route-21.com" },
+      })
+
 
       local consumer1 = assert(bp.consumers:insert {
         username = "bob",
@@ -239,6 +255,60 @@ do
           response_code = { 200 },
           request_method = { "GET", "HEAD", "POST" },
           vary_query_params = {"foo"}
+        },
+      })
+
+      assert(bp.plugins:insert {
+        name = "proxy-cache",
+        route = { id = route17.id },
+        config = {
+          strategy = policy,
+          [policy] = policy_config,
+          content_type = { "*/*" },
+        },
+      })
+
+      assert(bp.plugins:insert {
+        name = "proxy-cache",
+        route = { id = route18.id },
+        config = {
+          strategy = policy,
+          [policy] = policy_config,
+          content_type = { "application/xml; charset=UTF-8" },
+        },
+      })
+
+      assert(bp.plugins:insert {
+        name = "proxy-cache",
+        route = { id = route19.id },
+        config = {
+          strategy = policy,
+          [policy] = policy_config,
+          content_type = { "application/xml;" }, -- invalid content_type
+        },
+      })
+
+      assert(bp.plugins:insert {
+        name = "proxy-cache",
+        route = { id = route20.id },
+        config = {
+          strategy = policy,
+          response_code = {404},
+          ignore_uri_case = true,
+          content_type = { "text/plain", "application/json" },
+          [policy] = policy_config,
+        },
+      })
+
+      assert(bp.plugins:insert {
+        name = "proxy-cache",
+        route = { id = route21.id },
+        config = {
+          strategy = policy,
+          response_code = {404},
+          ignore_uri_case = false,
+          content_type = { "text/plain", "application/json" },
+          [policy] = policy_config,
         },
       })
 
@@ -1240,5 +1310,135 @@ do
         assert.matches("^%d+$", res.headers["X-Kong-Upstream-Latency"])
       end)
     end)
+
+    describe("content-type", function()
+      it("should cache a request with wildcard content_type(*/*)", function()
+        local request = {
+          method = "GET",
+          path = "/xml",
+          headers = {
+            host = "route-17.com",
+          },
+        }
+
+        local res = assert(client:send(request))
+        assert.res_status(200, res)
+        assert.same("application/xml", res.headers["Content-Type"])
+        assert.same("Miss", res.headers["X-Cache-Status"])
+
+        local res = assert(client:send(request))
+        assert.res_status(200, res)
+        assert.same("application/xml", res.headers["Content-Type"])
+        assert.same("Hit", res.headers["X-Cache-Status"])
+      end)
+
+      it("should not cache a request while parameter is not match", function()
+        local res = assert(client:send {
+          method = "GET",
+          path = "/xml",
+          headers = {
+            host = "route-18.com",
+          },
+        })
+
+        assert.res_status(200, res)
+        assert.same("application/xml", res.headers["Content-Type"])
+        assert.same("Bypass", res.headers["X-Cache-Status"])
+      end)
+
+
+      it("should not cause error while upstream returns a invalid content type", function()
+        local res = assert(client:send {
+          method = "GET",
+          path = "/response-headers?Content-Type=application/xml;",
+          headers = {
+            host = "route-18.com",
+          },
+        })
+
+        assert.res_status(200, res)
+        assert.same("application/xml;", res.headers["Content-Type"])
+        assert.same("Bypass", res.headers["X-Cache-Status"])
+      end)
+
+      it("should not cause error while config.content_type has invalid element", function()
+        local res, err = client:send {
+          method = "GET",
+          path = "/xml",
+          headers = {
+            host = "route-19.com",
+          },
+        }
+
+        assert.is_nil(err)
+        assert.res_status(200, res)
+        assert.same("application/xml", res.headers["Content-Type"])
+        assert.same("Bypass", res.headers["X-Cache-Status"])
+      end)
+    end)
+
+    it("ignore uri case in cache_key", function()
+      local res = assert(client:send {
+        method = "GET",
+        path = "/ignore-case/kong",
+        headers = {
+          host = "route-20.com",
+        },
+      })
+
+      local body1 = assert.res_status(404, res)
+      assert.same("Miss", res.headers["X-Cache-Status"])
+
+      local cache_key1 = res.headers["X-Cache-Key"]
+      assert.matches("^[%w%d]+$", cache_key1)
+      assert.equals(64, #cache_key1)
+
+      local res = client:send {
+        method = "GET",
+        path = "/ignore-case/KONG",
+        headers = {
+          host = "route-20.com",
+        },
+      }
+
+      local body2 = assert.res_status(404, res)
+      assert.same("Hit", res.headers["X-Cache-Status"])
+      local cache_key2 = res.headers["X-Cache-Key"]
+      assert.same(cache_key1, cache_key2)
+
+      assert.same(body1, body2)
+    end)
+
+    it("acknowledge uri case in cache_key", function()
+      local res = assert(client:send {
+        method = "GET",
+        path = "/acknowledge-case/kong",
+        headers = {
+          host = "route-21.com",
+        },
+      })
+
+      assert.res_status(404, res)
+      local x_cache_status = assert.response(res).has_header("X-Cache-Status")
+      assert.same("Miss", x_cache_status)
+
+      local cache_key1 = res.headers["X-Cache-Key"]
+      assert.matches("^[%w%d]+$", cache_key1)
+      assert.equals(64, #cache_key1)
+
+      res = assert(client:send {
+        method = "GET",
+        path = "/acknowledge-case/KONG",
+        headers = {
+          host = "route-21.com",
+        },
+      })
+
+      x_cache_status = assert.response(res).has_header("X-Cache-Status")
+      local cache_key2 = assert.response(res).has_header("X-Cache-Key")
+      assert.same("Miss", x_cache_status)
+      assert.not_same(cache_key1, cache_key2)
+    end)
+
   end)
 end

@@ -1,5 +1,6 @@
 local typedefs = require "kong.db.schema.typedefs"
 local constants = require "kong.plugins.statsd.constants"
+local deprecation = require("kong.deprecation")
 
 
 local METRIC_NAMES = {
@@ -31,21 +32,27 @@ local WORKSPACE_IDENTIFIERS = {
 
 local DEFAULT_METRICS = {
   {
-    name               = "request_count",
-    stat_type          = "counter",
-    sample_rate        = 1,
-    service_identifier = nil,
+    name                  = "request_count",
+    stat_type             = "counter",
+    sample_rate           = 1,
+    service_identifier    = nil,
+    consumer_identifier   = nil,
+    workspace_identifier  = nil,
   },
   {
-    name               = "latency",
-    stat_type          = "timer",
-    service_identifier = nil,
+    name                = "latency",
+    stat_type           = "timer",
+    service_identifier  = nil,
+    consumer_identifier = nil,
+    workspace_identifier = nil,
   },
   {
-    name               = "request_size",
-    stat_type          = "counter",
-    sample_rate        = 1,
-    service_identifier = nil,
+    name                  = "request_size",
+    stat_type             = "counter",
+    sample_rate           = 1,
+    service_identifier    = nil,
+    consumer_identifier   = nil,
+    workspace_identifier  = nil,
   },
   {
     name               = "status_count",
@@ -54,10 +61,12 @@ local DEFAULT_METRICS = {
     service_identifier = nil,
   },
   {
-    name               = "response_size",
-    stat_type          = "counter",
-    sample_rate        = 1,
-    service_identifier = nil,
+    name                  = "response_size",
+    stat_type             = "counter",
+    sample_rate           = 1,
+    service_identifier    = nil,
+    consumer_identifier   = nil,
+    workspace_identifier  = nil,
   },
   {
     name                = "unique_users",
@@ -73,14 +82,18 @@ local DEFAULT_METRICS = {
     service_identifier  = nil,
   },
   {
-    name               = "upstream_latency",
-    stat_type          = "timer",
-    service_identifier = nil,
+    name                  = "upstream_latency",
+    stat_type             = "timer",
+    service_identifier    = nil,
+    consumer_identifier   = nil,
+    workspace_identifier  = nil,
   },
   {
-    name               = "kong_latency",
-    stat_type          = "timer",
-    service_identifier = nil,
+    name                  = "kong_latency",
+    stat_type             = "timer",
+    service_identifier    = nil,
+    consumer_identifier   = nil,
+    workspace_identifier  = nil,
   },
   {
     name                = "status_count_per_user",
@@ -110,6 +123,10 @@ local DEFAULT_METRICS = {
   },
 }
 
+local TAG_TYPE = {
+  "dogstatsd", "influxdb",
+  "librato", "signalfx",
+}
 
 local MUST_IDENTIFIER = {}
 
@@ -173,9 +190,31 @@ return {
           { consumer_identifier_default = { type = "string", required = true, default = "custom_id", one_of = CONSUMER_IDENTIFIERS }, },
           { service_identifier_default = { type = "string", required = true, default = "service_name_or_host", one_of = SERVICE_IDENTIFIERS }, },
           { workspace_identifier_default = { type = "string", required = true, default = "workspace_id", one_of = WORKSPACE_IDENTIFIERS }, },
-          { retry_count = { type = "integer", required = true, default = 10 }, },
-          { queue_size = { type = "integer", required = true, default = 1 }, },
-          { flush_timeout = { type = "number", required = true, default = 2 }, },
+          { retry_count = { type = "integer" }, },
+          { queue_size = { type = "integer" }, },
+          { flush_timeout = { type = "number" }, },
+          { tag_style = { type = "string", required = false, one_of = TAG_TYPE }, },
+          { queue = typedefs.queue },
+        },
+        entity_checks = {
+          { custom_entity_check = {
+            field_sources = { "retry_count", "queue_size", "flush_timeout" },
+            fn = function(entity)
+              if (entity.retry_count or ngx.null) ~= ngx.null and entity.retry_count ~= 10 then
+                deprecation("statsd: config.retry_count no longer works, please use config.queue.max_retry_time instead",
+                            { after = "4.0", })
+              end
+              if (entity.queue_size or ngx.null) ~= ngx.null and entity.queue_size ~= 1 then
+                deprecation("statsd: config.queue_size is deprecated, please use config.queue.max_batch_size instead",
+                            { after = "4.0", })
+              end
+              if (entity.flush_timeout or ngx.null) ~= ngx.null and entity.flush_timeout ~= 2 then
+                deprecation("statsd: config.flush_timeout is deprecated, please use config.queue.max_coalescing_delay instead",
+                            { after = "4.0", })
+              end
+              return true
+            end
+          } },
         },
       },
     },

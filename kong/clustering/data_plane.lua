@@ -46,12 +46,24 @@ local function is_timeout(err)
 end
 
 
-function _M.new(conf, cert, cert_key)
+function _M.new(clustering)
+  assert(type(clustering) == "table",
+         "kong.clustering is not instantiated")
+
+  assert(type(clustering.conf) == "table",
+         "kong.clustering did not provide configuration")
+
+  assert(type(clustering.cert) == "table",
+         "kong.clustering did not provide the cluster certificate")
+
+  assert(type(clustering.cert_key) == "cdata",
+         "kong.clustering did not provide the cluster certificate private key")
+
   local self = {
-    declarative_config = declarative.new_config(conf),
-    conf = conf,
-    cert = cert,
-    cert_key = cert_key,
+    declarative_config = assert(declarative.new_config(clustering.conf)),
+    conf = clustering.conf,
+    cert = clustering.cert,
+    cert_key = clustering.cert_key,
   }
 
   return setmetatable(self, _MT)
@@ -63,11 +75,10 @@ function _M:init_worker(plugins_list)
 
   self.plugins_list = plugins_list
 
-  if clustering_utils.is_dp_worker_process() then
-    assert(ngx.timer.at(0, function(premature)
-      self:communicate(premature)
-    end))
-  end
+  -- only run in process which worker_id() == 0
+  assert(ngx.timer.at(0, function(premature)
+    self:communicate(premature)
+  end))
 end
 
 
@@ -102,8 +113,7 @@ function _M:communicate(premature)
   local log_suffix = " [" .. conf.cluster_control_plane .. "]"
   local reconnection_delay = math.random(5, 10)
 
-  local c, uri, err = clustering_utils.connect_cp(
-                        "/v1/outlet", conf, self.cert, self.cert_key)
+  local c, uri, err = clustering_utils.connect_cp(self, "/v1/outlet")
   if not c then
     ngx_log(ngx_ERR, _log_prefix, "connection to control plane ", uri, " broken: ", err,
                  " (retrying after ", reconnection_delay, " seconds)", log_suffix)
@@ -114,12 +124,24 @@ function _M:communicate(premature)
     return
   end
 
+  local labels do
+    if kong.configuration.cluster_dp_labels then
+      labels = {}
+      for _, lab in ipairs(kong.configuration.cluster_dp_labels) do
+        local del = lab:find(":", 1, true)
+        labels[lab:sub(1, del - 1)] = lab:sub(del + 1)
+      end
+    end
+  end
+
   -- connection established
-  -- first, send out the plugin list to CP so it can make decision on whether
-  -- sync will be allowed later
+  -- first, send out the plugin list and DP labels to CP
+  -- The CP will make the decision on whether sync will be allowed
+  -- based no the received information
   local _
   _, err = c:send_binary(cjson_encode({ type = "basic_info",
-                                        plugins = self.plugins_list, }))
+                                        plugins = self.plugins_list,
+                                        labels = labels, }))
   if err then
     ngx_log(ngx_ERR, _log_prefix, "unable to send basic information to control plane: ", uri,
                      " err: ", err, " (retrying after ", reconnection_delay, " seconds)", log_suffix)

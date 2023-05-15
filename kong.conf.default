@@ -103,34 +103,37 @@
                                  # such in the Lua namespace:
                                  # `kong.vaults.{name}.*`.
 
-#opentelemetry_tracing = off     # Comma-separated list of tracing instrumentations
-                                 # this node should load. By default, no instrumentations
-                                 # are enabled.
-                                 #
-                                 # Valid values to this setting are:
-                                 #
-                                 # - `off`: do not enable instrumentations.
-                                 # - `request`: only enable request-level instrumentations.
-                                 # - `all`: enable all the following instrumentations.
-                                 # - `db_query`: trace database query, including
-                                 #   Postgres and Cassandra.
-                                 # - `dns_query`: trace DNS query.
-                                 # - `router`: trace router execution, including
-                                 #   router rebuilding.
-                                 # - `http_client`: trace OpenResty HTTP client requests.
-                                 # - `balancer`: trace balancer retries.
-                                 # - `plugin_rewrite`: trace plugins iterator
-                                 #   execution with rewrite phase.
-                                 # - `plugin_access`: trace plugins iterator
-                                 #   execution with access phase.
-                                 # - `plugin_header_filter`: trace plugins iterator
-                                 #   execution with header_filter phase.
-                                 #
-                                 # **Note:** In the current implementation,
-                                 # tracing instrumentations are not enabled in
-                                 # stream mode.
+#opentelemetry_tracing = off                # Deprecated: use tracing_instrumentations instead
 
-#opentelemetry_tracing_sampling_rate = 1.0  # Tracing instrumentation sampling rate.
+#tracing_instrumentations = off             # Comma-separated list of tracing instrumentations
+                                            # this node should load. By default, no instrumentations
+                                            # are enabled.
+                                            #
+                                            # Valid values to this setting are:
+                                            #
+                                            # - `off`: do not enable instrumentations.
+                                            # - `request`: only enable request-level instrumentations.
+                                            # - `all`: enable all the following instrumentations.
+                                            # - `db_query`: trace database query, including
+                                            #   Postgres and Cassandra.
+                                            # - `dns_query`: trace DNS query.
+                                            # - `router`: trace router execution, including
+                                            #   router rebuilding.
+                                            # - `http_client`: trace OpenResty HTTP client requests.
+                                            # - `balancer`: trace balancer retries.
+                                            # - `plugin_rewrite`: trace plugins iterator
+                                            #   execution with rewrite phase.
+                                            # - `plugin_access`: trace plugins iterator
+                                            #   execution with access phase.
+                                            # - `plugin_header_filter`: trace plugins iterator
+                                            #   execution with header_filter phase.
+                                            #
+                                            # **Note:** In the current implementation,
+                                            # tracing instrumentations are not enabled in
+                                            # stream mode.
+
+#opentelemetry_tracing_sampling_rate = 1.0  # Deprecated: use tracing_sampling_rate instead
+#tracing_sampling_rate = 0.01               # Tracing instrumentation sampling rate.
                                             # Tracer samples a fixed percentage of all spans
                                             # following the sampling rate.
                                             #
@@ -223,7 +226,7 @@
 
 
 #proxy_server =                  # Proxy server defined as a URL. Kong will only use this
-                                 # option if any component is explictly configured
+                                 # option if any component is explicitly configured
                                  # to use proxy.
 
 
@@ -231,6 +234,42 @@
                                  # `proxy_server` is in HTTPS.
                                  # See the `lua_ssl_trusted_certificate`
                                  # setting to specify a certificate authority.
+
+#error_template_html =           # Path to the custom html error template to
+                                 # override the default html kong error template.
+                                 #
+                                 # The template is required to contain one single `%s`
+                                 # placeholder for the error message, as in the
+                                 # following example:
+                                 # ```
+                                 # <html>
+                                 #   <body>
+                                 #     <h1>My custom error template</h1>
+                                 #     <p>%s.</p>
+                                 #   </body>
+                                 # </html>
+                                 # ```
+
+#error_template_json =           # Path to the custom json error template to
+                                 # override the default json kong error template.
+                                 #
+                                 # Similarly to `error_template_html`, the template
+                                 # is required to contain one single `%s` placeholder for
+                                 # the error message.
+
+#error_template_xml =            # Path to the custom xml error template to
+                                 # override the default xml kong error template
+                                 #
+                                 # Similarly to `error_template_html`, the template
+                                 # is required to contain one single `%s` placeholder for
+                                 # the error message.
+
+#error_template_plain =          # Path to the custom plain error template to
+                                 # override the default plain kong error template
+                                 #
+                                 # Similarly to `error_template_html`, the template
+                                 # is required to contain one single `%s` placeholder for
+                                 # the error message.
 #------------------------------------------------------------------------------
 # HYBRID MODE
 #------------------------------------------------------------------------------
@@ -345,6 +384,23 @@
                                  # This sets the maximum payload size allowed
                                  # to be sent across from CP to DP in Hybrid mode
                                  # Default is 4Mb - 4 * 1024 * 1024 due to historical reasons
+
+#cluster_dp_labels =             # Comma separated list of Labels for the data plane.
+                                 # Labels are key-value pairs that provide additional
+                                 # context information for each DP.
+                                 # Each label must be configured as a string in the
+                                 # format `key:value`.
+                                 #
+                                 # Labels are only compatible with hybrid mode
+                                 # deployments with Kong Konnect (SaaS),
+                                 # this configuration doesn't work with
+                                 # self-hosted deployments.
+                                 #
+                                 # Keys and values follow the AIP standards:
+                                 # https://kong-aip.netlify.app/aip/129/
+                                 #
+                                 # Example:
+                                 # `deployment:mycloud,region:us-east-1`
 
 #------------------------------------------------------------------------------
 # HYBRID MODE CONTROL PLANE
@@ -547,6 +603,12 @@
                          # to Kong administrators *only*. This value accepts
                          # IPv4, IPv6, and hostnames.
                          #
+                         # It is highly recommended to avoid exposing the Admin API to public
+                         # interface(s), by using values such as 0.0.0.0:8001
+                         #
+                         # See https://docs.konghq.com/gateway/latest/production/running-kong/secure-admin-api/
+                         # for more information about how to secure your Admin API
+                         #
                          # Some suffixes can be specified for each pair:
                          #
                          # - `ssl` will require that all connections made
@@ -660,7 +722,7 @@
                                  #
                                  # See https://wiki.mozilla.org/Security/Server_Side_TLS
                                  # for detailed descriptions of each cipher
-                                 # suite. `fips` cipher suites are as decribed in
+                                 # suite. `fips` cipher suites are as described in
                                  # https://wiki.openssl.org/index.php/FIPS_mode_and_TLS.
 
 #ssl_ciphers =                   # Defines a custom list of TLS ciphers to be
@@ -714,6 +776,10 @@
                                  # https://github.com/mozilla/server-side-tls/issues/198
                                  #
                                  # See http://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_session_timeout
+
+#ssl_session_cache_size = 10m    # Sets the size of the caches that store session parameters
+                                 #
+                                 # See https://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_session_cache
 
 #ssl_cert =                      # Comma-separated list of certificates for `proxy_listen` values with TLS enabled.
                                  #
@@ -926,6 +992,12 @@
                                         # connection may be kept open
                                         # indefinitely.
 
+#allow_debug_header = off               # Enable the `Kong-Debug` header function.
+                                        # if it is `on`, kong will add
+                                        # `Kong-Route-Id` `Kong-Route-Name` `Kong-Service-Id`
+                                        # `Kong-Service-Name` debug headers to response when
+                                        # the client request header `Kong-Debug: 1` is present.
+
 #------------------------------------------------------------------------------
 # NGINX injected directives
 #------------------------------------------------------------------------------
@@ -1023,6 +1095,15 @@
 
 #nginx_admin_client_max_body_size = 10m  # Defines the maximum request body size for
                                          # Admin API.
+
+#nginx_http_charset = UTF-8  # Adds the specified charset to the “Content-Type”
+                             # response header field. If this charset is different
+                             # from the charset specified in the source_charset
+                             # directive, a conversion is performed.
+                             #
+                             # The parameter `off` cancels the addition of
+                             # charset to the “Content-Type” response header field.
+                             # See http://nginx.org/en/docs/http/ngx_http_charset_module.html#charset
 
 #nginx_http_client_body_buffer_size = 8k  # Defines the buffer size for reading
                                           # the request body. If the client
@@ -1343,6 +1424,15 @@
 
 #declarative_config_string =    # The declarative configuration as a string
 
+#lmdb_environment_path = dbless.lmdb  # Directory where the LMDB database files used by
+                                      # DB-less and Hybrid mode to store Kong
+                                      # configurations reside.
+                                      #
+                                      # This path is relative under the Kong `prefix`.
+
+#lmdb_map_size = 128m                 # Maximum size of the LMDB memory map, used to store the
+                                      # DB-less and Hybird mode configurations. Default is 128m.
+
 #------------------------------------------------------------------------------
 # DATASTORE CACHE
 #------------------------------------------------------------------------------
@@ -1498,6 +1588,33 @@
                                  # single query.
 
 #------------------------------------------------------------------------------
+# VAULTS
+#------------------------------------------------------------------------------
+
+# A secret is any sensitive piece of information required for API gateway
+# operations. Secrets may be part of the core Kong Gateway configuration,
+# used in plugins, or part of the configuration associated with APIs serviced
+# by the gateway.
+#
+# Some of the most common types of secrets used by Kong Gateway include:
+#
+# - Data store usernames and passwords, used with PostgreSQL and Redis
+# - Private X.509 certificates
+# - API keys
+#
+# Sensitive plugin configuration fields are generally used for authentication,
+# hashing, signing, or encryption. Kong Gateway lets you store certain values
+# in a vault. Here are the vault specific configuration options.
+
+#vault_env_prefix =              # Defines the environment variable vault's
+                                 # default prefix. For example if you have
+                                 # all your secrets stored in environment
+                                 # variables prefixed with `SECRETS_`, it
+                                 # can be configured here so that it isn't
+                                 # necessary to repeat them in Vault
+                                 # references.
+
+#------------------------------------------------------------------------------
 # TUNING & BEHAVIOR
 #------------------------------------------------------------------------------
 
@@ -1579,6 +1696,44 @@
                                  #   `traditional_compatible` did not work as expected.
                                  #   This flavor of router will be removed in the next
                                  #   major release of Kong.
+
+#lua_max_req_headers = 100       # Maximum number of request headers to parse by default.
+                                 #
+                                 # This argument can be set to an integer between 1 and 1000.
+                                 #
+                                 # When proxying the Kong sends all the request headers
+                                 # and this setting does not have any effect. It is used
+                                 # to limit Kong and its plugins from reading too many
+                                 # request headers.
+
+#lua_max_resp_headers = 100      # Maximum number of response headers to parse by default.
+                                 #
+                                 # This argument can be set to an integer between 1 and 1000.
+                                 #
+                                 # When proxying, Kong returns all the response headers
+                                 # and this setting does not have any effect. It is used
+                                 # to limit Kong and its plugins from reading too many
+                                 # response headers.
+
+#lua_max_uri_args = 100          # Maximum number of request uri arguments to parse by
+                                 # default.
+                                 #
+                                 # This argument can be set to an integer between 1 and 1000.
+                                 #
+                                 # When proxying, Kong sends all the request query
+                                 # arguments and this setting does not have any effect.
+                                 # It is used to limit Kong and its plugins from reading
+                                 # too many query arguments.
+
+#lua_max_post_args = 100         # Maximum number of request post arguments to parse by
+                                 # default.
+                                 #
+                                 # This argument can be set to an integer between 1 and 1000.
+                                 #
+                                 # When proxying, Kong sends all the request post
+                                 # arguments and this setting does not have any effect.
+                                 # It is used to limit Kong and its plugins from reading
+                                 # too many post arguments.
 
 #------------------------------------------------------------------------------
 # MISCELLANEOUS
@@ -1772,12 +1927,7 @@
                                   # behavior and explicitly instructs Kong which
                                   # OpenResty installation to use.
 
-#max_queued_batches = 100         # Maximum number of batches to keep on an internal
-                                  # plugin queue before dropping old batches.  This is
-                                  # meant as a global, last-resort control to prevent
-                                  # queues from consuming infinite memory.  When batches
-                                  # are being dropped, an error message
-                                  # "exceeded max_queued_batches (%d), dropping oldest"
-                                  # will be logged.  The error message will also include
-                                  # a string that identifies the plugin causing the
-                                  # problem.
+#node_id =                        # Node ID for the Kong node. Every Kong node
+                                  # in a Kong cluster must have a unique and
+                                  # valid UUID. When empty, node ID is
+                                  # automatically generated.

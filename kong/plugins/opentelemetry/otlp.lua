@@ -11,7 +11,10 @@ local tablepool_fetch = tablepool.fetch
 local tablepool_release = tablepool.release
 local deep_copy = utils.deep_copy
 local table_merge = utils.table_merge
+local setmetatable = setmetatable
 
+local TRACE_ID_LEN = 16
+local NULL = "\0"
 local POOL_OTLP = "KONG_OTLP"
 local EMPTY_TAB = {}
 
@@ -20,6 +23,16 @@ for i = 0, 2 do
   PB_STATUS[i] = { code = i }
 end
 
+local KEY_TO_ATTRIBUTE_TYPES = {
+  ["http.status_code"] = "int_value",
+}
+
+local TYPE_TO_ATTRIBUTE_TYPES = {
+  string = "string_value",
+  number = "double_value",
+  boolean = "bool_value",
+}
+
 local function transform_attributes(attr)
   if type(attr) ~= "table" then
     error("invalid attributes", 2)
@@ -27,25 +40,12 @@ local function transform_attributes(attr)
 
   local pb_attributes = new_tab(nkeys(attr), 0)
   for k, v in pairs(attr) do
-    local typ = type(v)
-    local pb_val
 
-    if typ == "string" then
-      pb_val = { string_value = v }
-
-    elseif typ == "number" then
-      pb_val = { double_value = v }
-
-    elseif typ == "boolean" then
-      pb_val = { bool_value = v }
-
-    else
-      pb_val = EMPTY_TAB -- considered empty
-    end
+    local attribute_type = KEY_TO_ATTRIBUTE_TYPES[k] or TYPE_TO_ATTRIBUTE_TYPES[type(v)]
 
     insert(pb_attributes, {
       key = k,
-      value = pb_val,
+      value = attribute_type and { [attribute_type] = v } or EMPTY_TAB
     })
   end
 
@@ -75,11 +75,26 @@ local function transform_events(events)
   return pb_events
 end
 
+-- translate the trace_id to otlp format
+local function to_ot_trace_id(trace_id)
+  local len = #trace_id
+  if len > TRACE_ID_LEN then
+    return trace_id:sub(-TRACE_ID_LEN)
+
+  elseif len < TRACE_ID_LEN then
+    return NULL:rep(TRACE_ID_LEN - len) .. trace_id
+  end
+
+  return trace_id
+end
+
+-- this function is to prepare span to be encoded and sent via grpc
+-- TODO: renaming this to encode_span
 local function transform_span(span)
   assert(type(span) == "table")
 
   local pb_span = {
-    trace_id = span.trace_id,
+    trace_id = to_ot_trace_id(span.trace_id),
     span_id = span.span_id,
     -- trace_state = "",
     parent_span_id = span.parent_id or "",
@@ -164,6 +179,7 @@ do
 end
 
 return {
+  to_ot_trace_id = to_ot_trace_id,
   transform_span = transform_span,
   encode_traces = encode_traces,
 }

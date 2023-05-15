@@ -30,10 +30,11 @@ local fmt          = string.format
 local sub          = string.sub
 local utils_toposort = utils.topological_sort
 local insert       = table.insert
+local table_merge  = utils.table_merge
 
 
 local WARN                          = ngx.WARN
-local ERR                           = ngx.ERR
+local DEBUG                         = ngx.DEBUG
 local SQL_INFORMATION_SCHEMA_TABLES = [[
 SELECT table_name
   FROM information_schema.tables
@@ -315,8 +316,7 @@ end
 
 
 function _mt:init_worker(strategies)
-  if ngx.worker.id() == 0 then
-
+  if ngx.worker.id() == 0 and #kong.configuration.admin_listeners > 0 then
     local table_names = get_names_of_tables_with_ttl(strategies)
     local ttl_escaped = self:escape_identifier("ttl")
     local expire_at_escaped = self:escape_identifier("expire_at")
@@ -326,43 +326,64 @@ function _mt:init_worker(strategies)
       local table_name = table_names[i]
       local column_name = table_name == "cluster_events" and expire_at_escaped
                                                           or ttl_escaped
-      cleanup_statements[i] = concat {
-        "  DELETE FROM ",
-        self:escape_identifier(table_name),
-        " WHERE ",
-        column_name,
-        " < CURRENT_TIMESTAMP AT TIME ZONE 'UTC';"
-      }
+      local table_name_escaped = self:escape_identifier(table_name)
+
+      cleanup_statements[i] = fmt([[
+    WITH rows AS (
+  SELECT ctid
+    FROM %s
+   WHERE %s < TO_TIMESTAMP(%s) AT TIME ZONE 'UTC'
+ORDER BY %s LIMIT 50000 FOR UPDATE SKIP LOCKED)
+  DELETE
+    FROM %s
+   WHERE ctid IN (TABLE rows);]], table_name_escaped, column_name, "%s", column_name, table_name_escaped)
     end
 
-    local cleanup_statement = concat(cleanup_statements, "\n")
-
-    return timer_every(60, function(premature)
+    return timer_every(self.config.ttl_cleanup_interval, function(premature)
       if premature then
         return
       end
 
-      local ok, err, _, num_queries = self:query(cleanup_statement)
+      -- Fetch the end timestamp from database to avoid problems caused by the difference
+      -- between nodes and database time.
+      local cleanup_end_timestamp
+      local ok, err = self:query("SELECT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP AT TIME ZONE 'UTC') AS NOW;")
       if not ok then
-        if num_queries then
-          for i = num_queries + 1, cleanup_statements_count do
-            local statement = cleanup_statements[i]
-            local ok, err = self:query(statement)
-            if not ok then
-              if err then
-                log(WARN, "unable to clean expired rows from table '",
-                          table_names[i], "' on PostgreSQL database (",
-                          err, ")")
-              else
-                log(WARN, "unable to clean expired rows from table '",
-                          table_names[i], "' on PostgreSQL database")
-              end
+        log(WARN, "unable to fetch current timestamp from PostgreSQL database (",
+                  err, ")")
+        return
+      end
+
+      cleanup_end_timestamp = ok[1]["now"]
+
+      for i, statement in ipairs(cleanup_statements) do
+        local _tracing_cleanup_start_time = now()
+
+        while true do -- batch delete looping
+          -- using the server-side timestamp in the whole loop to prevent infinite loop
+          local ok, err = self:query(fmt(statement, cleanup_end_timestamp))
+          if not ok then
+            if err then
+              log(WARN, "unable to clean expired rows from table '",
+                        table_names[i], "' on PostgreSQL database (",
+                        err, ")")
+
+            else
+              log(WARN, "unable to clean expired rows from table '",
+                        table_names[i], "' on PostgreSQL database")
             end
+            break
           end
 
-        else
-          log(ERR, "unable to clean expired rows from PostgreSQL database (", err, ")")
+          if ok.affected_rows < 50000 then -- indicates that cleanup is done
+            break
+          end
         end
+
+        local _tracing_cleanup_end_time = now()
+        local time_elapsed = tonumber(fmt("%.3f", _tracing_cleanup_end_time - _tracing_cleanup_start_time))
+        log(DEBUG, "cleaning up expired rows from table '", table_names[i],
+                   "' took ", time_elapsed, " seconds")
       end
     end)
   end
@@ -920,6 +941,7 @@ local _M = {}
 
 function _M.new(kong_config)
   local config = {
+    application_name = "kong",
     host        = kong_config.pg_host,
     port        = kong_config.pg_port,
     timeout     = kong_config.pg_timeout,
@@ -937,6 +959,8 @@ function _M.new(kong_config)
 
     --- not used directly by pgmoon, but used internally in connector to set the keepalive timeout
     keepalive_timeout = kong_config.pg_keepalive_timeout,
+    --- non user-faced parameters
+    ttl_cleanup_interval = kong_config._debug_pg_ttl_cleanup_interval or 300,
   }
 
   local refs = kong_config["$refs"]
@@ -974,6 +998,7 @@ function _M.new(kong_config)
     ngx.log(ngx.DEBUG, "PostgreSQL connector readonly connection enabled")
 
     local ro_override = {
+      application_name = "kong",
       host        = kong_config.pg_ro_host,
       port        = kong_config.pg_ro_port,
       timeout     = kong_config.pg_ro_timeout,
@@ -1005,7 +1030,7 @@ function _M.new(kong_config)
       end
     end
 
-    local config_ro = utils.table_merge(config, ro_override)
+    local config_ro = table_merge(config, ro_override)
 
     local sem
     if config_ro.sem_max > 0 then

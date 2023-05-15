@@ -26,9 +26,7 @@ local find = string.find
 local lower = string.lower
 local error = error
 local pairs = pairs
-local ipairs = ipairs
 local concat = table.concat
-local tonumber = tonumber
 local coroutine = coroutine
 local cjson_encode = cjson.encode
 local normalize_header = checks.normalize_header
@@ -36,7 +34,6 @@ local normalize_multi_header = checks.normalize_multi_header
 local validate_header = checks.validate_header
 local validate_headers = checks.validate_headers
 local check_phase = phase_checker.check
-local split = utils.split
 local add_header
 local is_http_subsystem = ngx and ngx.config.subsystem == "http"
 if is_http_subsystem then
@@ -66,7 +63,6 @@ local function new(self, major_version)
   local _RESPONSE = {}
 
   local MIN_HEADERS          = 1
-  local MAX_HEADERS_DEFAULT  = 100
   local MAX_HEADERS          = 1000
 
   local MIN_STATUS_CODE      = 100
@@ -120,66 +116,66 @@ local function new(self, major_version)
     [16] = "Unauthenticated",
   }
 
-local get_http_error_message
-do
-  local HTTP_ERROR_MESSAGES = {
-    [400] = "Bad request",
-    [401] = "Unauthorized",
-    [402] = "Payment required",
-    [403] = "Forbidden",
-    [404] = "Not found",
-    [405] = "Method not allowed",
-    [406] = "Not acceptable",
-    [407] = "Proxy authentication required",
-    [408] = "Request timeout",
-    [409] = "Conflict",
-    [410] = "Gone",
-    [411] = "Length required",
-    [412] = "Precondition failed",
-    [413] = "Payload too large",
-    [414] = "URI too long",
-    [415] = "Unsupported media type",
-    [416] = "Range not satisfiable",
-    [417] = "Expectation failed",
-    [418] = "I'm a teapot",
-    [421] = "Misdirected request",
-    [422] = "Unprocessable entity",
-    [423] = "Locked",
-    [424] = "Failed dependency",
-    [425] = "Too early",
-    [426] = "Upgrade required",
-    [428] = "Precondition required",
-    [429] = "Too many requests",
-    [431] = "Request header fields too large",
-    [451] = "Unavailable for legal reasons",
-    [494] = "Request header or cookie too large",
-    [500] = "An unexpected error occurred",
-    [501] = "Not implemented",
-    [502] = "An invalid response was received from the upstream server",
-    [503] = "The upstream server is currently unavailable",
-    [504] = "The upstream server is timing out",
-    [505] = "HTTP version not supported",
-    [506] = "Variant also negotiates",
-    [507] = "Insufficient storage",
-    [508] = "Loop detected",
-    [510] = "Not extended",
-    [511] = "Network authentication required",
-  }
+  local get_http_error_message
+  do
+    local HTTP_ERROR_MESSAGES = {
+      [400] = "Bad request",
+      [401] = "Unauthorized",
+      [402] = "Payment required",
+      [403] = "Forbidden",
+      [404] = "Not found",
+      [405] = "Method not allowed",
+      [406] = "Not acceptable",
+      [407] = "Proxy authentication required",
+      [408] = "Request timeout",
+      [409] = "Conflict",
+      [410] = "Gone",
+      [411] = "Length required",
+      [412] = "Precondition failed",
+      [413] = "Payload too large",
+      [414] = "URI too long",
+      [415] = "Unsupported media type",
+      [416] = "Range not satisfiable",
+      [417] = "Expectation failed",
+      [418] = "I'm a teapot",
+      [421] = "Misdirected request",
+      [422] = "Unprocessable entity",
+      [423] = "Locked",
+      [424] = "Failed dependency",
+      [425] = "Too early",
+      [426] = "Upgrade required",
+      [428] = "Precondition required",
+      [429] = "Too many requests",
+      [431] = "Request header fields too large",
+      [451] = "Unavailable for legal reasons",
+      [494] = "Request header or cookie too large",
+      [500] = "An unexpected error occurred",
+      [501] = "Not implemented",
+      [502] = "An invalid response was received from the upstream server",
+      [503] = "The upstream server is currently unavailable",
+      [504] = "The upstream server is timing out",
+      [505] = "HTTP version not supported",
+      [506] = "Variant also negotiates",
+      [507] = "Insufficient storage",
+      [508] = "Loop detected",
+      [510] = "Not extended",
+      [511] = "Network authentication required",
+    }
 
 
-  function get_http_error_message(status)
-    local msg = HTTP_ERROR_MESSAGES[status]
+    function get_http_error_message(status)
+      local msg = HTTP_ERROR_MESSAGES[status]
 
-    if msg then
+      if msg then
+        return msg
+      end
+
+      msg = fmt("The upstream server responded with %d", status)
+      HTTP_ERROR_MESSAGES[status] = msg
+
       return msg
     end
-
-    msg = fmt("The upstream server responded with %d", status)
-    HTTP_ERROR_MESSAGES[status] = msg
-
-    return msg
   end
-end
 
 
   ---
@@ -271,9 +267,10 @@ end
   -- headers as the client would see them upon reception, including headers
   -- added by Kong itself.
   --
-  -- By default, this function returns up to **100** headers. The optional
-  -- `max_headers` argument can be specified to customize this limit, but must
-  -- be greater than **1** and equal to or less than **1000**.
+  -- By default, this function returns up to **100** headers (or what has been
+  -- configured using `lua_max_resp_headers`). The optional `max_headers` argument
+  -- can be specified to customize this limit, but must be greater than **1** and
+  -- equal to or less than **1000**.
   --
   -- @function kong.response.get_headers
   -- @phases header_filter, response, body_filter, log, admin_api
@@ -298,7 +295,7 @@ end
     check_phase(header_body_log)
 
     if max_headers == nil then
-      return ngx.resp.get_headers(MAX_HEADERS_DEFAULT)
+      return ngx.resp.get_headers()
     end
 
     if type(max_headers) ~= "number" then
@@ -1061,39 +1058,6 @@ end
   end
 
 
-  local function get_response_type(content_header)
-    local type = CONTENT_TYPE_JSON
-
-    if content_header ~= nil then
-      local accept_values = split(content_header, ",")
-      local max_quality = 0
-      for _, value in ipairs(accept_values) do
-        local mimetype_values = split(value, ";")
-        local name
-        local quality = 1
-        for _, entry in ipairs(mimetype_values) do
-          local m = ngx.re.match(entry, [[^\s*(\S+\/\S+)\s*$]], "ajo")
-          if m then
-            name = m[1]
-          else
-            m = ngx.re.match(entry, [[^\s*q=([0-9]*[\.][0-9]+)\s*$]], "ajoi")
-            if m then
-              quality = tonumber(m[1])
-            end
-          end
-        end
-
-        if name and quality > max_quality then
-          type = utils.get_mime_type(name)
-          max_quality = quality
-        end
-      end
-    end
-
-    return type
-  end
-
-
   ---
   -- This function interrupts the current processing and produces an error
   -- response.
@@ -1195,11 +1159,8 @@ end
       if is_grpc_request() then
         content_type = CONTENT_TYPE_GRPC
       else
-        content_type_header = ngx.req.get_headers()[ACCEPT_NAME]
-        if type(content_type_header) == "table" then
-          content_type_header = content_type_header[1]
-        end
-        content_type = get_response_type(content_type_header)
+        local accept_header = ngx.req.get_headers()[ACCEPT_NAME]
+        content_type = utils.get_response_type(accept_header)
       end
     end
 

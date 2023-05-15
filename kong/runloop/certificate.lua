@@ -19,14 +19,25 @@ local set_cert = ngx_ssl.set_cert
 local set_priv_key = ngx_ssl.set_priv_key
 local tb_concat   = table.concat
 local tb_sort   = table.sort
+local kong = kong
+local type = type
+local error = error
+local assert = assert
 local tostring = tostring
 local ipairs = ipairs
 local ngx_md5 = ngx.md5
+local ngx_exit = ngx.exit
+local ngx_ERROR = ngx.ERROR
 
 
 local default_cert_and_key
 
 local DEFAULT_SNI = "*"
+
+local CA_KEY = {
+  id = "",
+}
+
 
 local function log(lvl, ...)
   ngx_log(lvl, "[ssl] ", ...)
@@ -227,12 +238,36 @@ local function find_certificate(sni)
     return nil, err
   end
 
-  for _, sni, err in mlcache.each_bulk_res(res) do
+  for _, new_sni, err in mlcache.each_bulk_res(res) do
+    if new_sni then
+      return get_certificate(new_sni.certificate, new_sni.name)
+    end
     if err then
-      log(ERR, "failed to fetch SNI: ", err)
+      -- we choose to not call typedefs.wildcard_host.custom_validator(sni)
+      -- in the front to reduce the cost in normal flow.
+      -- these error messages are from validate_wildcard_host()
+      local patterns = {
+        "must not be an IP",
+        "must not have a port",
+        "invalid value: ",
+        "only one wildcard must be specified",
+        "wildcard must be leftmost or rightmost character",
+      }
+      local idx
 
-    elseif sni then
-      return get_certificate(sni.certificate, sni.name)
+      for _, pat in ipairs(patterns) do
+        idx = err:find(pat, nil, true)
+        if idx then
+          break
+        end
+      end
+
+      if idx then
+        kong.log.debug("invalid SNI '", sni, "', ", err:sub(idx),
+                       ", serving default SSL certificate")
+      else
+        log(ERR, "failed to fetch SNI: ", err)
+      end
     end
   end
 
@@ -244,13 +279,13 @@ local function execute()
   local sn, err = server_name()
   if err then
     log(ERR, "could not retrieve SNI: ", err)
-    return ngx.exit(ngx.ERROR)
+    return ngx_exit(ngx_ERROR)
   end
 
   local cert_and_key, err = find_certificate(sn)
   if err then
     log(ERR, err)
-    return ngx.exit(ngx.ERROR)
+    return ngx_exit(ngx_ERROR)
   end
 
   if cert_and_key == default_cert_and_key then
@@ -263,32 +298,32 @@ local function execute()
   local ok, err = clear_certs()
   if not ok then
     log(ERR, "could not clear existing (default) certificates: ", err)
-    return ngx.exit(ngx.ERROR)
+    return ngx_exit(ngx_ERROR)
   end
 
   ok, err = set_cert(cert_and_key.cert)
   if not ok then
     log(ERR, "could not set configured certificate: ", err)
-    return ngx.exit(ngx.ERROR)
+    return ngx_exit(ngx_ERROR)
   end
 
   ok, err = set_priv_key(cert_and_key.key)
   if not ok then
     log(ERR, "could not set configured private key: ", err)
-    return ngx.exit(ngx.ERROR)
+    return ngx_exit(ngx_ERROR)
   end
 
   if cert_and_key.cert_alt and cert_and_key.key_alt then
     ok, err = set_cert(cert_and_key.cert_alt)
     if not ok then
       log(ERR, "could not set alternate configured certificate: ", err)
-      return ngx.exit(ngx.ERROR)
+      return ngx_exit(ngx_ERROR)
     end
 
     ok, err = set_priv_key(cert_and_key.key_alt)
     if not ok then
       log(ERR, "could not set alternate configured private key: ", err)
-      return ngx.exit(ngx.ERROR)
+      return ngx_exit(ngx_ERROR)
     end
   end
 end
@@ -302,12 +337,11 @@ end
 
 local function fetch_ca_certificates(ca_ids)
   local cas = new_tab(#ca_ids, 0)
-  local key = new_tab(1, 0)
 
   for i, ca_id in ipairs(ca_ids) do
-    key.id = ca_id
+    CA_KEY.id = ca_id
 
-    local obj, err = kong.db.ca_certificates:select(key)
+    local obj, err = kong.db.ca_certificates:select(CA_KEY)
     if not obj then
       if err then
         return nil, err

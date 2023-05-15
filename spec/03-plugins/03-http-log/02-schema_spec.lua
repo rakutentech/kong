@@ -1,6 +1,10 @@
 local PLUGIN_NAME = "http-log"
 
 
+local Queue = require "kong.tools.queue"
+local utils = require "kong.tools.utils"
+local mocker = require "spec.fixtures.mocker"
+
 -- helper function to validate data against a schema
 local validate do
   local validate_entity = require("spec.helpers").validate_plugin_config_schema
@@ -13,7 +17,40 @@ end
 
 
 describe(PLUGIN_NAME .. ": (schema)", function()
+  local unmock
+  local log_messages
 
+  before_each(function()
+    log_messages = ""
+    local function log(level, message) -- luacheck: ignore
+      log_messages = log_messages .. level .. " " .. message .. "\n"
+    end
+
+    mocker.setup(function(f)
+      unmock = f
+    end, {
+      kong = {
+        log = {
+          debug = function(message) return log('DEBUG', message) end,
+          info = function(message) return log('INFO', message) end,
+          warn = function(message) return log('WARN', message) end,
+          err = function(message) return log('ERR', message) end,
+        },
+        plugin = {
+          get_id = function () return utils.uuid() end,
+        },
+      },
+      ngx = {
+        ctx = {
+          -- make sure our workspace is nil to begin with to prevent leakage from
+          -- other tests
+          workspace = nil
+        },
+      }
+    })
+  end)
+
+  after_each(unmock)
 
   it("accepts minimal config with defaults", function()
     local ok, err = validate({
@@ -127,4 +164,20 @@ describe(PLUGIN_NAME .. ": (schema)", function()
     assert.is_falsy(ok)
   end)
 
+  it("converts legacy queue parameters", function()
+    local entity = validate({
+      http_endpoint = "http://hi:there@myservice.com/path",
+      retry_count = 23,
+      queue_size = 46,
+      flush_timeout = 92,
+    })
+    assert.is_truthy(entity)
+    entity.config.queue.name = "legacy-conversion-test"
+    local conf = Queue.get_plugin_params("http-log", entity.config)
+    assert.match_re(log_messages, "the retry_count parameter no longer works")
+    assert.match_re(log_messages, "the queue_size parameter is deprecated")
+    assert.match_re(log_messages, "the flush_timeout parameter is deprecated")
+    assert.is_same(46, conf.max_batch_size)
+    assert.is_same(92, conf.max_coalescing_delay)
+  end)
 end)

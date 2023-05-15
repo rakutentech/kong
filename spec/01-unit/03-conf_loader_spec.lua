@@ -55,6 +55,7 @@ describe("Configuration loader", function()
     assert.same({}, conf.admin_ssl_cert_key)
     assert.same({}, conf.status_ssl_cert)
     assert.same({}, conf.status_ssl_cert_key)
+    assert.same(false, conf.allow_debug_header)
     assert.is_nil(getmetatable(conf))
   end)
   it("loads a given file, with higher precedence", function()
@@ -122,12 +123,6 @@ describe("Configuration loader", function()
     assert.same(2, tablex.size(conf.loaded_plugins))
     assert.True(conf.loaded_plugins["foo"])
     assert.True(conf.loaded_plugins["bar"])
-  end)
-  it("apply # transformations when loading from config file directly", function()
-    local conf = assert(conf_loader(nil, {
-      pg_password = "!abCDefGHijKL4\\#1MN2OP3",
-    }))
-    assert.same("!abCDefGHijKL4#1MN2OP3", conf.pg_password)
   end)
   it("no longer applies # transformations when loading from .kong_env (issue #5761)", function()
     local conf = assert(conf_loader(nil, {
@@ -311,26 +306,26 @@ describe("Configuration loader", function()
     }))
     assert.equal("test##12##3#", conf.pg_password)
   end)
-  it("does not modify existing escaped octothorpes in environment variables", function()
+  it("does not modify existing octothorpes in environment variables", function()
     finally(function()
       helpers.unsetenv("KONG_PG_PASSWORD")
     end)
-    helpers.setenv("KONG_PG_PASSWORD", [[test\#123]])
+    helpers.setenv("KONG_PG_PASSWORD", [[test#123]])
     local conf = assert(conf_loader())
     assert.equal("test#123", conf.pg_password)
 
-    helpers.setenv("KONG_PG_PASSWORD", [[test\#\#12\#\#3\#]])
+    helpers.setenv("KONG_PG_PASSWORD", [[test##12##3#]])
     local conf = assert(conf_loader())
     assert.equal("test##12##3#", conf.pg_password)
   end)
-  it("does not modify existing escaped octothorpes in custom_conf overrides", function()
+  it("does not modify existing octothorpes in custom_conf overrides", function()
     local conf = assert(conf_loader(nil, {
-      pg_password = [[test\#123]],
+      pg_password = [[test#123]],
     }))
     assert.equal("test#123", conf.pg_password)
 
     local conf = assert(conf_loader(nil, {
-      pg_password = [[test\#\#12\#\#3\#]],
+      pg_password = [[test##12##3#]],
     }))
     assert.equal("test##12##3#", conf.pg_password)
   end)
@@ -671,6 +666,20 @@ describe("Configuration loader", function()
       })
       assert.is_nil(err)
       assert.is_table(conf)
+    end)
+    it("errors when node_id is not a valid uuid", function()
+      local conf, err = conf_loader(nil, {
+        node_id = "foobar",
+      })
+      assert.equal("node_id must be a valid UUID", err)
+      assert.is_nil(conf)
+    end)
+    it("accepts a valid UUID as node_id", function()
+      local conf, err = conf_loader(nil, {
+        node_id = "8b7de2ba-0477-4667-a811-8bca46073ca9",
+      })
+      assert.is_nil(err)
+      assert.equal("8b7de2ba-0477-4667-a811-8bca46073ca9", conf.node_id)
     end)
     it("errors when the hosts file does not exist", function()
       local tmpfile = "/a_file_that_does_not_exist"
@@ -1769,6 +1778,38 @@ describe("Configuration loader", function()
       assert.equal("strict", conf.worker_consistency)
       assert.equal(nil, err)
     end)
+
+    it("opentelemetry_tracing", function()
+      local conf, err = assert(conf_loader(nil, {
+        opentelemetry_tracing = "request,router",
+      }))
+      assert.same({"request", "router"}, conf.tracing_instrumentations)
+      assert.equal(nil, err)
+
+      -- no clobber
+      conf, err = assert(conf_loader(nil, {
+        opentelemetry_tracing = "request,router",
+        tracing_instrumentations = "balancer",
+      }))
+      assert.same({ "balancer" }, conf.tracing_instrumentations)
+      assert.equal(nil, err)
+    end)
+
+    it("opentelemetry_tracing_sampling_rate", function()
+      local conf, err = assert(conf_loader(nil, {
+        opentelemetry_tracing_sampling_rate = 0.5,
+      }))
+      assert.same(0.5, conf.tracing_sampling_rate)
+      assert.equal(nil, err)
+
+      -- no clobber
+      conf, err = assert(conf_loader(nil, {
+        opentelemetry_tracing_sampling_rate = 0.5,
+        tracing_sampling_rate = 0.75,
+      }))
+      assert.same(0.75, conf.tracing_sampling_rate)
+      assert.equal(nil, err)
+    end)
   end)
 
   describe("vault references", function()
@@ -1801,4 +1842,157 @@ describe("Configuration loader", function()
       assert.equal("{vault://env/pg-port#0}", conf["$refs"].pg_port)
     end)
   end)
+
+  describe("comments", function()
+    it("are stripped", function()
+      local conf = assert(conf_loader(helpers.test_conf_path))
+      assert.equal("foo#bar", conf.pg_password)
+    end)
+  end)
+
+  describe("lua max limits for request/response headers and request uri/post args", function()
+    it("are accepted", function()
+      local conf, err = assert(conf_loader(nil, {
+        lua_max_req_headers = 1,
+        lua_max_resp_headers = 100,
+        lua_max_uri_args = 500,
+        lua_max_post_args = 1000,
+      }))
+
+      assert.is_nil(err)
+
+      assert.equal(1, conf.lua_max_req_headers)
+      assert.equal(100, conf.lua_max_resp_headers)
+      assert.equal(500, conf.lua_max_uri_args)
+      assert.equal(1000, conf.lua_max_post_args)
+    end)
+
+    it("are not accepted with limits below 1", function()
+      local _, err = conf_loader(nil, {
+        lua_max_req_headers = 0,
+      })
+      assert.equal("lua_max_req_headers must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_resp_headers = 0,
+      })
+      assert.equal("lua_max_resp_headers must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_uri_args = 0,
+      })
+      assert.equal("lua_max_uri_args must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_post_args = 0,
+      })
+      assert.equal("lua_max_post_args must be an integer between 1 and 1000", err)
+    end)
+
+    it("are not accepted with limits above 1000", function()
+      local _, err = conf_loader(nil, {
+        lua_max_req_headers = 1001,
+      })
+      assert.equal("lua_max_req_headers must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_resp_headers = 1001,
+      })
+      assert.equal("lua_max_resp_headers must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_uri_args = 1001,
+      })
+      assert.equal("lua_max_uri_args must be an integer between 1 and 1000", err)
+
+      local _, err = conf_loader(nil, {
+        lua_max_post_args = 1001,
+      })
+      assert.equal("lua_max_post_args must be an integer between 1 and 1000", err)
+    end)
+  end)
+
+  describe("Labels", function()
+    local pattern_match_err = ".+ is invalid. Must match pattern: .+"
+    local size_err = ".* must have between 1 and %d+ characters"
+    local invalid_key_err = "label key validation failed: "
+    local invalid_val_err = "label value validation failed: "
+    local valid_labels = {
+      "deployment:mycloud,region:us-east-1",
+      "label_0_name:label-1-value,label-1-name:label_1_value",
+      "MY-LaB3L.nam_e:my_lA831..val",
+      "super_kong:yey",
+      "best_gateway:kong",
+      "This_Key_Is_Just_The_Right_Maximum_Length_To_Pass_TheValidation:value",
+      "key:This_Val_Is_Just_The_Right_Maximum_Length_To_Pass_TheValidation",
+    }
+    local invalid_labels = {
+      {
+        l = "t:h,e:s,E:a,r:e,T:o,o:m,a:n,y:l,A:b,ee:l,S:s",
+        err = "labels validation failed: count exceeded %d+ max elements",
+      },{
+        l = "_must:start",
+        err = invalid_key_err .. pattern_match_err,
+      },{
+        l = "and:.end",
+        err = invalid_val_err .. pattern_match_err,
+      },{
+        l = "with-:alpha",
+        err = invalid_key_err .. pattern_match_err,
+      },{
+        l = "numeric:characters_",
+        err = invalid_val_err .. pattern_match_err,
+      },{
+        l = "kong_key:is_reserved",
+        err = invalid_key_err .. pattern_match_err,
+      },{
+        l = "invalid!@chars:fail",
+        err = invalid_key_err .. pattern_match_err,
+      },{
+        l = "the:val!dation",
+        err = invalid_val_err .. pattern_match_err,
+      },{
+        l = "lonelykeywithnoval:",
+        err = invalid_val_err .. size_err,
+      },{
+        l = "__look_this_key_is_way_too_long_no_way_it_will_pass_validation__:value",
+        err = invalid_key_err .. size_err,
+      },{
+        l = "key:__look_this_val_is_way_too_long_no_way_it_will_pass_validation__",
+        err = invalid_val_err .. size_err,
+      },{
+        l = "key",
+        err = invalid_key_err .. size_err,
+      }
+    }
+
+    it("succeeds to validate valid labels", function()
+      for _, label in ipairs(valid_labels) do
+        local conf, err = assert(conf_loader(nil, {
+          role = "data_plane",
+          database = "off",
+          cluster_cert = "spec/fixtures/kong_clustering.crt",
+          cluster_cert_key = "spec/fixtures/kong_clustering.key",
+          cluster_dp_labels = label,
+        }))
+        assert.is_nil(err)
+        assert.is_not_nil(conf.cluster_dp_labels)
+      end
+    end)
+
+    it("fails validation for invalid labels", function()
+      for _, label in ipairs(invalid_labels) do
+        local _, err = conf_loader(nil, {
+          role = "data_plane",
+          database = "off",
+          cluster_cert = "spec/fixtures/kong_clustering.crt",
+          cluster_cert_key = "spec/fixtures/kong_clustering.key",
+          cluster_dp_labels = label.l,
+        })
+        assert.is_not_nil(err)
+        assert.matches(label.err, err)
+      end
+    end)
+  end)
+
 end)

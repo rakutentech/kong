@@ -34,4 +34,55 @@ return {
       "http_response_header_for_traceid",
     },
   },
+  -- Any dataplane older than 3.2.0
+  [3002000000] = {
+    statsd = {
+      "tag_style",
+    },
+    session = {
+      "audience",
+      "absolute_timeout",
+      "remember_cookie_name",
+      "remember_rolling_timeout",
+      "remember_absolute_timeout",
+      "response_headers",
+      "request_headers",
+    },
+    aws_lambda = {
+      "aws_imds_protocol_version",
+    },
+    zipkin = {
+      "phase_duration_flavor",
+    }
+  },
+  -- Any dataplane older than 3.3.0
+  [3003000000] = {
+    acme = {
+      "account_key",
+      "storage_config.redis.namespace",
+    },
+    aws_lambda = {
+      "disable_https",
+    },
+    proxy_cache = {
+      "ignore_uri_case",
+    },
+    opentelemetry = {
+      "http_response_header_for_traceid",
+      "queue",
+      "header_type",
+    },
+    http_log = {
+      "queue",
+    },
+    statsd = {
+      "queue",
+    },
+    datadog = {
+      "queue",
+    },
+    zipkin = {
+      "queue",
+    },
+  },
 }

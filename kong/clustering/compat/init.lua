@@ -26,6 +26,7 @@ local extract_major_minor = version.extract_major_minor
 local _log_prefix = "[clustering] "
 
 local REMOVED_FIELDS = require("kong.clustering.compat.removed_fields")
+local COMPATIBILITY_CHECKERS = require("kong.clustering.compat.checkers")
 local CLUSTERING_SYNC_STATUS = constants.CLUSTERING_SYNC_STATUS
 local KONG_VERSION = meta.version
 
@@ -235,7 +236,17 @@ local function delete_at(t, key)
 end
 
 
-local function invalidate_keys_from_config(config_plugins, keys, log_suffix)
+local function rename_field(config, name_from, name_to, has_update)
+  if config[name_from] ~= nil then
+    config[name_to] = config[name_from]
+    config[name_from] = nil
+    return true
+  end
+  return has_update
+end
+
+
+local function invalidate_keys_from_config(config_plugins, keys, log_suffix, dp_version_num)
   if not config_plugins then
     return false
   end
@@ -246,8 +257,24 @@ local function invalidate_keys_from_config(config_plugins, keys, log_suffix)
     local config = t and t["config"]
     if config then
       local name = gsub(t["name"], "-", "_")
-
       if keys[name] ~= nil then
+        -- Any dataplane older than 3.2.0
+        if dp_version_num < 3002000000 then
+          -- OSS
+          if name == "session" then
+            has_update = rename_field(config, "idling_timeout", "cookie_idletime", has_update)
+            has_update = rename_field(config, "rolling_timeout", "cookie_lifetime", has_update)
+            has_update = rename_field(config, "stale_ttl", "cookie_discard", has_update)
+            has_update = rename_field(config, "cookie_same_site", "cookie_samesite", has_update)
+            has_update = rename_field(config, "cookie_http_only", "cookie_httponly", has_update)
+            has_update = rename_field(config, "remember", "cookie_persistent", has_update)
+
+            if config["cookie_samesite"] == "Default" then
+              config["cookie_samesite"] = "Lax"
+            end
+          end
+        end
+
         for _, key in ipairs(keys[name]) do
           if delete_at(config, key) then
             ngx_log(ngx_WARN, _log_prefix, name, " plugin contains configuration '", key,
@@ -327,26 +354,18 @@ function _M.update_compatible_payload(payload, dp_version, log_suffix)
   payload = deep_copy(payload, false)
   local config_table = payload["config_table"]
 
-  local fields = get_removed_fields(dp_version_num)
-  if fields then
-    if invalidate_keys_from_config(config_table["plugins"], fields, log_suffix) then
+  for _, checker in ipairs(COMPATIBILITY_CHECKERS) do
+    local ver = checker[1]
+    local fn  = checker[2]
+    if dp_version_num < ver and fn(config_table, dp_version, log_suffix) then
       has_update = true
     end
   end
 
-  if dp_version_num < 3001000000 --[[ 3.1.0.0 ]] then
-    local config_upstream = config_table["upstreams"]
-    if config_upstream then
-      for _, t in ipairs(config_upstream) do
-        if t["use_srv_name"] ~= nil then
-          ngx_log(ngx_WARN, _log_prefix, "Kong Gateway v" .. KONG_VERSION ..
-                  " contains configuration 'upstream.use_srv_name'",
-                  " which is incompatible with dataplane version " .. dp_version .. " and will",
-                  " be removed.", log_suffix)
-          t["use_srv_name"] = nil
-          has_update = true
-        end
-      end
+  local fields = get_removed_fields(dp_version_num)
+  if fields then
+    if invalidate_keys_from_config(config_table["plugins"], fields, log_suffix, dp_version_num) then
+      has_update = true
     end
   end
 

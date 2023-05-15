@@ -17,7 +17,6 @@ lua_ssl_trusted_certificate '${{LUA_SSL_TRUSTED_CERTIFICATE_COMBINED}}';
 lua_shared_dict kong                        5m;
 lua_shared_dict kong_locks                  8m;
 lua_shared_dict kong_healthchecks           5m;
-lua_shared_dict kong_process_events         5m;
 lua_shared_dict kong_cluster_events         5m;
 lua_shared_dict kong_rate_limiting_counters 12m;
 lua_shared_dict kong_core_db_cache          ${{MEM_CACHE_SIZE}};
@@ -85,7 +84,7 @@ server {
     ssl_certificate     $(ssl_cert[i]);
     ssl_certificate_key $(ssl_cert_key[i]);
 > end
-    ssl_session_cache   shared:SSL:10m;
+    ssl_session_cache   shared:SSL:${{SSL_SESSION_CACHE_SIZE}};
     ssl_certificate_by_lua_block {
         Kong.ssl_certificate()
     }
@@ -332,6 +331,7 @@ server {
 
 > if (role == "control_plane" or role == "traditional") and #admin_listeners > 0 then
 server {
+    charset UTF-8;
     server_name kong_admin;
 > for _, entry in ipairs(admin_listeners) do
     listen $(entry.listener);
@@ -371,6 +371,7 @@ server {
 
 > if #status_listeners > 0 then
 server {
+    charset UTF-8;
     server_name kong_status;
 > for _, entry in ipairs(status_listeners) do
     listen $(entry.listener);
@@ -410,6 +411,7 @@ server {
 
 > if role == "control_plane" then
 server {
+    charset UTF-8;
     server_name kong_cluster_listener;
 > for _, entry in ipairs(cluster_listeners) do
     listen $(entry.listener) ssl;
@@ -437,8 +439,8 @@ server {
 }
 > end -- role == "control_plane"
 
-> if not legacy_worker_events then
 server {
+    charset UTF-8;
     server_name kong_worker_events;
     listen unix:${{PREFIX}}/worker_events.sock;
     access_log off;
@@ -448,5 +450,4 @@ server {
         }
     }
 }
-> end -- not legacy_worker_events
 ]]

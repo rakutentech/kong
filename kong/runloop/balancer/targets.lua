@@ -10,6 +10,7 @@ local dns_client = require "kong.resty.dns.client"
 local upstreams = require "kong.runloop.balancer.upstreams"
 local balancers = require "kong.runloop.balancer.balancers"
 local dns_utils = require "kong.resty.dns.utils"
+local utils = require "kong.tools.utils"
 
 local ngx = ngx
 local null = ngx.null
@@ -22,6 +23,7 @@ local tonumber = tonumber
 local table_sort = table.sort
 local assert = assert
 local exiting = ngx.worker.exiting
+local get_updated_now_ms = utils.get_updated_now_ms
 
 local CRIT = ngx.CRIT
 local DEBUG = ngx.DEBUG
@@ -37,6 +39,8 @@ local GLOBAL_QUERY_OPTS = { workspace = null, show_ws_id = true }
 -- renewing DNS records
 local renewal_heap = require("binaryheap").minUnique()
 local renewal_weak_cache = setmetatable({}, { __mode = "v" })
+
+local targets_by_upstream_id = {}
 
 local targets_M = {}
 
@@ -126,9 +130,17 @@ end
 function targets_M.fetch_targets(upstream)
   local targets_cache_key = "balancer:targets:" .. upstream.id
 
-  return kong.core_cache:get(
-      targets_cache_key, nil,
-      load_targets_into_memory, upstream.id)
+  if targets_by_upstream_id[targets_cache_key] == nil then
+    targets_by_upstream_id[targets_cache_key] = load_targets_into_memory(upstream.id)
+  end
+
+  return targets_by_upstream_id[targets_cache_key]
+end
+
+
+function targets_M.clean_targets_cache(upstream)
+  local targets_cache_key = "balancer:targets:" .. upstream.id
+  targets_by_upstream_id[targets_cache_key] = nil
 end
 
 
@@ -157,7 +169,14 @@ function targets_M.on_target_event(operation, target)
   log(DEBUG, "target ", operation, " for upstream ", upstream_id,
     upstream_name and " (" .. upstream_name ..")" or "")
 
-  kong.core_cache:invalidate_local("balancer:targets:" .. upstream_id)
+  targets_by_upstream_id["balancer:targets:" .. upstream_id] = nil
+
+  local upstream = upstreams.get_upstream_by_id(upstream_id)
+  if not upstream then
+    log(ERR, "target ", operation, ": upstream not found for ", upstream_id,
+      upstream_name and " (" .. upstream_name ..")" or "")
+    return
+  end
 
   -- cancel DNS renewal
   if operation ~= "create" then
@@ -168,13 +187,6 @@ function targets_M.on_target_event(operation, target)
     else
       log(ERR, "could not stop DNS renewal for target removed from ", upstream_id, ": ", err)
     end
-  end
-
-  local upstream = upstreams.get_upstream_by_id(upstream_id)
-  if not upstream then
-    log(ERR, "target ", operation, ": upstream not found for ", upstream_id,
-      upstream_name and " (" .. upstream_name ..")" or "")
-    return
   end
 
 -- move this to upstreams?
@@ -517,9 +529,11 @@ function targets_M.getAddressPeer(address, cacheOnly)
     return nil, balancers.errors.ERR_ADDRESS_UNAVAILABLE
   end
 
+  local ctx = ngx.ctx
   local target = address.target
   if targetExpired(target) and not cacheOnly then
     queryDns(target, cacheOnly)
+    ctx.KONG_UPSTREAM_DNS_END_AT = get_updated_now_ms()
     if address.target ~= target then
       return nil, balancers.errors.ERR_DNS_UPDATED
     end

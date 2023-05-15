@@ -3,21 +3,6 @@ local cjson  = require "cjson"
 local helpers = require "spec.helpers"
 
 
-local luacov_ok = pcall(require, "luacov")
-if luacov_ok then
-  local busted_it = it
-  -- luacheck: globals it
-  it = function(desc, fn)
-    busted_it(desc, function()
-      local luacov = require("luacov")
-      luacov.init()
-      fn()
-      luacov.save_stats()
-    end)
-  end
-end
-
-
 local SchemaKind = {
   { name = "schema", new = Schema.new, },
   { name = "subschema", new = function(definition)
@@ -115,14 +100,14 @@ describe("schema", function()
     it("validates a range with 'between'", function()
       local Test = Schema.new({
         fields = {
-          { a_number = { type = "number", between = { 10, 20 } } }
+          { a_number = { type = "number", between = { 9.5, 20.5 } } }
         }
       })
       assert.truthy(Test:validate({ a_number = 15 }))
       assert.truthy(Test:validate({ a_number = 10 }))
       assert.truthy(Test:validate({ a_number = 20 }))
-      assert.falsy(Test:validate({ a_number = 9 }))
-      assert.falsy(Test:validate({ a_number = 21 }))
+      assert.falsy(Test:validate({ a_number = 9.4 }))
+      assert.falsy(Test:validate({ a_number = 20.9 }))
       assert.falsy(Test:validate({ a_number = "wat" }))
     end)
 
@@ -871,6 +856,30 @@ describe("schema", function()
       assert.falsy(Test:validate({ f = { r = { a = 2 }}}))
       assert.falsy(Test:validate({ f = { r = { b = "foo" }}}))
       assert.falsy(Test:validate({ f = { r = { a = 2, b = "foo" }}}))
+    end)
+
+    it("validates shorthands type check with nested records", function()
+      local Test = Schema.new({
+        fields = {
+          { r = {
+              type = "record",
+              fields = {
+                { a = { type = "string" } },
+                { b = { type = "number" } } },
+              shorthand_fields = {
+                {
+                  username = {
+                    type = "string",
+                    func = function(value)
+                      return {
+                        b = value
+                      }
+                    end,
+                  }}}}}}})
+      local input =  { r = { username = 123 }}
+      local ok, err = Test:process_auto_fields(input)
+      assert.falsy(ok)
+      assert.same({ username = "expected a string" }, err)
     end)
 
     it("validates an integer", function()
